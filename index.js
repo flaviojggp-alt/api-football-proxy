@@ -31,18 +31,47 @@ app.get('/api/*', async (req, res) => {
 
 // Partidos próximos de una liga (próximos 7 días + en vivo + hoy)
 app.get('/fixtures/upcoming', async (req, res) => {
-  const { leagueId, season } = req.query;
+  const { leagueId } = req.query;
   if (!leagueId) return res.status(400).json({ error: 'Se requiere leagueId' });
-  const s = season || '2024';
 
   try {
-    // Fecha actual y +7 días
     const now = new Date();
     const from = now.toISOString().split('T')[0];
     const to = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
 
-    const d = await af(`/fixtures?league=${leagueId}&season=${s}&from=${from}&to=${to}&status=NS-1H-2H-HT`);
-    const fixtures = (d.response || []).slice(0, 20);
+    // Detectar temporada activa automáticamente desde la liga
+    const leagueInfo = await af(`/leagues?id=${leagueId}&current=true`);
+    const currentSeason = leagueInfo.response?.[0]?.seasons?.find(s => s.current)?.year;
+
+    // Si no hay temporada activa, intentar con el año actual y el anterior
+    const currentYear = now.getFullYear();
+    const seasonsToTry = currentSeason
+      ? [currentSeason]
+      : [currentYear, currentYear - 1];
+
+    let fixtures = [];
+    let usedSeason = null;
+
+    for (const s of seasonsToTry) {
+      const d = await af(`/fixtures?league=${leagueId}&season=${s}&from=${from}&to=${to}&status=NS-1H-2H-HT`);
+      if (d.response?.length) {
+        fixtures = d.response.slice(0, 20);
+        usedSeason = s;
+        break;
+      }
+    }
+
+    // Si aún no hay resultados, buscar sin filtro de fecha (próximos 3 partidos)
+    if (!fixtures.length) {
+      for (const s of seasonsToTry) {
+        const d = await af(`/fixtures?league=${leagueId}&season=${s}&next=10`);
+        if (d.response?.length) {
+          fixtures = d.response.slice(0, 20);
+          usedSeason = s;
+          break;
+        }
+      }
+    }
 
     const result = fixtures.map(f => ({
       fixtureId: f.fixture.id,
@@ -56,7 +85,7 @@ app.get('/fixtures/upcoming', async (req, res) => {
       round: f.league.round,
     }));
 
-    res.json({ fixtures: result, count: result.length, from, to });
+    res.json({ fixtures: result, count: result.length, from, to, season: usedSeason });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
