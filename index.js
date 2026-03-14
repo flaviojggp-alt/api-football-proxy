@@ -4,137 +4,201 @@ const fetch = require('node-fetch');
 
 const app = express();
 const PORT = process.env.PORT || 8080;
-const API_FOOTBALL_BASE = 'https://v3.football.api-sports.io';
-const ODDS_API_BASE = 'https://api.the-odds-api.com/v4';
+const AF = 'https://v3.football.api-sports.io';
+const ODDS_BASE = 'https://api.the-odds-api.com/v4';
 
 app.use(cors());
 app.use(express.json());
 
-console.log('API_FOOTBALL_KEY presente:', !!process.env.API_FOOTBALL_KEY);
-console.log('ODDS_API_KEY presente:', !!process.env.ODDS_API_KEY);
+async function af(path) {
+  const KEY = process.env.API_FOOTBALL_KEY;
+  const r = await fetch(`${AF}${path}`, { headers: { 'x-apisports-key': KEY, 'Accept': 'application/json' } });
+  return r.json();
+}
 
-app.get('/', (req, res) => {
-  res.json({
-    status: 'ok',
-    message: 'API-Football + Odds Proxy activo',
-    football_key: !!process.env.API_FOOTBALL_KEY,
-    odds_key: !!process.env.ODDS_API_KEY,
-  });
-});
+app.get('/', (req, res) => res.json({ status: 'ok', football_key: !!process.env.API_FOOTBALL_KEY, odds_key: !!process.env.ODDS_API_KEY }));
 
-// Proxy API-Football — reenvía cualquier ruta
+// Proxy genérico API-Football
 app.get('/api/*', async (req, res) => {
-  const API_KEY = process.env.API_FOOTBALL_KEY;
-  if (!API_KEY) return res.status(500).json({ error: 'API_FOOTBALL_KEY no configurada' });
+  if (!process.env.API_FOOTBALL_KEY) return res.status(500).json({ error: 'API_FOOTBALL_KEY no configurada' });
   const path = req.path.replace('/api', '');
   const query = new URLSearchParams(req.query).toString();
-  const url = `${API_FOOTBALL_BASE}${path}${query ? '?' + query : ''}`;
   try {
-    const response = await fetch(url, {
-      headers: { 'x-apisports-key': API_KEY, 'Accept': 'application/json' },
-    });
-    const data = await response.json();
-    res.status(response.status).json(data);
-  } catch (err) {
-    res.status(500).json({ error: 'Error API-Football', detail: err.message });
-  }
+    const r = await fetch(`${AF}${path}${query ? '?' + query : ''}`, { headers: { 'x-apisports-key': process.env.API_FOOTBALL_KEY, 'Accept': 'application/json' } });
+    res.status(r.status).json(await r.json());
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Head to Head — estadísticas de enfrentamientos directos
-app.get('/h2h', async (req, res) => {
-  const API_KEY = process.env.API_FOOTBALL_KEY;
-  if (!API_KEY) return res.status(500).json({ error: 'API_FOOTBALL_KEY no configurada' });
-  const { home, away, last } = req.query;
-  if (!home || !away) return res.status(400).json({ error: 'Se requieren home y away (IDs)' });
-  const url = `${API_FOOTBALL_BASE}/fixtures/headtohead?h2h=${home}-${away}&last=${last||10}&status=FT`;
+// Lesiones activas de un equipo
+app.get('/injuries', async (req, res) => {
+  const { teamId, season } = req.query;
+  if (!teamId) return res.status(400).json({ error: 'Se requiere teamId' });
   try {
-    const response = await fetch(url, {
-      headers: { 'x-apisports-key': API_KEY, 'Accept': 'application/json' },
+    const d = await af(`/injuries?team=${teamId}&season=${season || '2024'}`);
+    const injuries = (d.response || []).map(i => ({
+      player: i.player.name,
+      type: i.player.type,
+      reason: i.player.reason,
+      playerId: i.player.id,
+    }));
+    res.json({ injuries, count: injuries.length });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Alineación probable de un fixture
+app.get('/lineups', async (req, res) => {
+  const { fixtureId, teamId } = req.query;
+  if (!fixtureId) return res.status(400).json({ error: 'Se requiere fixtureId' });
+  try {
+    const d = await af(`/fixtures/lineups?fixture=${fixtureId}${teamId ? '&team=' + teamId : ''}`);
+    const lineups = (d.response || []).map(l => ({
+      team: l.team,
+      formation: l.formation,
+      startXI: (l.startXI || []).map(p => ({ id: p.player.id, name: p.player.name, number: p.player.number, pos: p.player.pos, grid: p.player.grid })),
+      substitutes: (l.substitutes || []).map(p => ({ id: p.player.id, name: p.player.name, pos: p.player.pos })),
+    }));
+    res.json({ lineups });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Próximo fixture entre dos equipos para obtener alineaciones probables
+app.get('/next-fixture', async (req, res) => {
+  const { homeId, awayId, season } = req.query;
+  if (!homeId || !awayId) return res.status(400).json({ error: 'Se requieren homeId y awayId' });
+  try {
+    const d = await af(`/fixtures/headtohead?h2h=${homeId}-${awayId}&next=1`);
+    const fixture = d.response?.[0];
+    if (!fixture) return res.json({ found: false });
+    res.json({ found: true, fixtureId: fixture.fixture.id, date: fixture.fixture.date, venue: fixture.fixture.venue?.name, league: fixture.league });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Predicciones nativas de API-Football para un fixture
+app.get('/predictions', async (req, res) => {
+  const { fixtureId } = req.query;
+  if (!fixtureId) return res.status(400).json({ error: 'Se requiere fixtureId' });
+  try {
+    const d = await af(`/predictions?fixture=${fixtureId}`);
+    const pred = d.response?.[0];
+    if (!pred) return res.json({ found: false });
+    res.json({
+      found: true,
+      winner: pred.predictions?.winner,
+      winOrDraw: pred.predictions?.win_or_draw,
+      underOver: pred.predictions?.under_over,
+      goals: pred.predictions?.goals,
+      advice: pred.predictions?.advice,
+      percent: pred.predictions?.percent,
+      comparison: pred.comparison,
     });
-    const data = await response.json();
-    // Enriquecer con estadísticas por partido
-    const fixtures = data.response || [];
-    const enriched = [];
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Stats avanzadas contextuales con nivel de rival
+app.get('/stats/advanced', async (req, res) => {
+  if (!process.env.API_FOOTBALL_KEY) return res.status(500).json({ error: 'API_FOOTBALL_KEY no configurada' });
+  const { teamId, opponentId, season } = req.query;
+  if (!teamId || !opponentId) return res.status(400).json({ error: 'Se requieren teamId y opponentId' });
+  const s = season || '2024';
+
+  try {
+    // Liga y posición del equipo y rival
+    const getLeague = async (tid) => { try { const d = await af(`/leagues?team=${tid}&season=${s}&type=League`); return d.response?.[0]?.league?.id || null; } catch(e){return null;} };
+    const getRank = async (tid, lid) => { if(!lid) return null; try { const d = await af(`/standings?league=${lid}&season=${s}&team=${tid}`); const st=d.response?.[0]?.league?.standings?.[0]||[]; return st.find(x=>x.team.id===parseInt(tid))?.rank||null; } catch(e){return null;} };
+
+    const [tLeague, oLeague] = await Promise.all([getLeague(teamId), getLeague(opponentId)]);
+    const [teamRank, opponentRank] = await Promise.all([getRank(teamId, tLeague), getRank(opponentId, oLeague)]);
+    const opponentTier = !opponentRank ? 'unknown' : opponentRank <= 6 ? 'top' : opponentRank <= 12 ? 'mid' : 'low';
+
+    const fixtData = await af(`/fixtures?team=${teamId}&season=${s}&last=10&status=FT`);
+    const fixtures = fixtData?.response || [];
+    const allStats = [], fwdMap = {};
+
     for (const fix of fixtures.slice(0, 10)) {
-      const fid = fix.fixture.id;
+      const fid = fix.fixture.id, isHome = fix.teams.home.id === parseInt(teamId);
+      const rivalId = isHome ? fix.teams.away.id : fix.teams.home.id;
+      let rivalRank = null;
+      try { const rl = await getLeague(rivalId); if(rl) rivalRank = await getRank(rivalId, rl); } catch(e){}
+      const rivalTier = !rivalRank ? 'unknown' : rivalRank <= 6 ? 'top' : rivalRank <= 12 ? 'mid' : 'low';
       try {
-        const [statsHome, statsAway] = await Promise.all([
-          fetch(`${API_FOOTBALL_BASE}/fixtures/statistics?fixture=${fid}&team=${home}`, {
-            headers: { 'x-apisports-key': API_KEY }
-          }).then(r => r.json()),
-          fetch(`${API_FOOTBALL_BASE}/fixtures/statistics?fixture=${fid}&team=${away}`, {
-            headers: { 'x-apisports-key': API_KEY }
-          }).then(r => r.json()),
+        const [sd, pd] = await Promise.all([
+          af(`/fixtures/statistics?fixture=${fid}&team=${teamId}`),
+          af(`/fixtures/players?fixture=${fid}&team=${teamId}`),
         ]);
-        enriched.push({
-          fixture: fix.fixture,
-          teams: fix.teams,
-          score: fix.score,
-          league: fix.league,
-          statsHome: statsHome.response?.[0]?.statistics || [],
-          statsAway: statsAway.response?.[0]?.statistics || [],
+        const sr = sd?.response?.[0]?.statistics || [];
+        const getS = t => parseFloat(sr.find(s => s.type === t)?.value) || 0;
+        allStats.push({ rivalTier, rivalRank, isHome,
+          goals: isHome ? (fix.score.fulltime.home||0) : (fix.score.fulltime.away||0),
+          corners: getS('Corner Kicks'), cards: getS('Yellow Cards') + getS('Red Cards'),
+          shots: getS('Total Shots'), saves: getS('Goalkeeper Saves'),
         });
-      } catch(e) {
-        enriched.push({ fixture: fix.fixture, teams: fix.teams, score: fix.score, league: fix.league, statsHome: [], statsAway: [] });
-      }
+        (pd?.response?.[0]?.players || []).forEach(p => {
+          if (p.player.pos === 'F' || p.player.pos === 'A') {
+            const pid = p.player.id, shots = p.statistics?.[0]?.shots?.total || 0, goals = p.statistics?.[0]?.goals?.total || 0;
+            if (!fwdMap[pid]) fwdMap[pid] = { name: p.player.name, shots: 0, goals: 0, games: 0 };
+            fwdMap[pid].shots += shots; fwdMap[pid].goals += goals; fwdMap[pid].games++;
+          }
+        });
+      } catch(e) {}
     }
-    res.json({ response: enriched, results: enriched.length });
-  } catch (err) {
-    res.status(500).json({ error: 'Error H2H', detail: err.message });
-  }
+
+    const n = allStats.length || 1;
+    const avg = k => allStats.reduce((s,m) => s+(m[k]||0), 0) / n;
+    const byTier = (tier, k) => { const f=allStats.filter(m=>m.rivalTier===tier); return f.length ? f.reduce((s,m)=>s+(m[k]||0),0)/f.length : null; };
+    const ctx = k => { const t=byTier(opponentTier,k), g=avg(k); return t!==null ? t*0.6+g*0.4 : g; };
+
+    const topForwards = Object.values(fwdMap).filter(f=>f.games>=3)
+      .map(f => { const p=f.name.split(' '); return { name: p.length<=2?f.name:p[0][0]+'. '+p.slice(1).join(' '), shots:f.shots/f.games, goals:f.goals/f.games }; })
+      .sort((a,b)=>b.shots-a.shots).slice(0,3);
+
+    res.json({
+      teamId:parseInt(teamId), teamRank, opponentRank, opponentTier, sampleSize:n,
+      global:{ goals:+avg('goals').toFixed(2), corners:+avg('corners').toFixed(2), cards:+avg('cards').toFixed(2), shots:+avg('shots').toFixed(2), saves:+avg('saves').toFixed(2) },
+      contextual:{ goals:+ctx('goals').toFixed(2), corners:+ctx('corners').toFixed(2), cards:+ctx('cards').toFixed(2), shots:+ctx('shots').toFixed(2), saves:+ctx('saves').toFixed(2) },
+      byTier:{ top:{goals:byTier('top','goals'),shots:byTier('top','shots'),saves:byTier('top','saves')}, mid:{goals:byTier('mid','goals'),shots:byTier('mid','shots'),saves:byTier('mid','saves')}, low:{goals:byTier('low','goals'),shots:byTier('low','shots'),saves:byTier('low','saves')} },
+      topForwards,
+    });
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// Proxy The Odds API
+// H2H enriquecido
+app.get('/h2h', async (req, res) => {
+  const { home, away, last } = req.query;
+  if (!home||!away) return res.status(400).json({ error: 'Se requieren home y away' });
+  try {
+    const data = await af(`/fixtures/headtohead?h2h=${home}-${away}&last=${last||10}&status=FT`);
+    const enriched = [];
+    for (const fix of (data.response||[]).slice(0,10)) {
+      try {
+        const [sH,sA] = await Promise.all([af(`/fixtures/statistics?fixture=${fix.fixture.id}&team=${home}`),af(`/fixtures/statistics?fixture=${fix.fixture.id}&team=${away}`)]);
+        enriched.push({fixture:fix.fixture,teams:fix.teams,score:fix.score,league:fix.league,statsHome:sH.response?.[0]?.statistics||[],statsAway:sA.response?.[0]?.statistics||[]});
+      } catch(e){enriched.push({fixture:fix.fixture,teams:fix.teams,score:fix.score,league:fix.league,statsHome:[],statsAway:[]});}
+    }
+    res.json({ response:enriched, results:enriched.length });
+  } catch(e){res.status(500).json({error:e.message});}
+});
+
+// Odds API
 app.get('/odds/match', async (req, res) => {
   const ODDS_KEY = process.env.ODDS_API_KEY;
   if (!ODDS_KEY) return res.status(500).json({ error: 'ODDS_API_KEY no configurada' });
   const { home, away, sport } = req.query;
-  if (!home || !away) return res.status(400).json({ error: 'Se requieren home y away' });
-  const sportKey = sport || 'soccer_epl';
-  const url = `${ODDS_API_BASE}/sports/${sportKey}/odds/?apiKey=${ODDS_KEY}&regions=eu&markets=h2h&oddsFormat=decimal`;
+  if (!home||!away) return res.status(400).json({ error: 'Se requieren home y away' });
   try {
-    const response = await fetch(url);
-    const games = await response.json();
-    if (!Array.isArray(games)) return res.status(200).json({ found: false, games: [] });
-    const homeLower = home.toLowerCase();
-    const awayLower = away.toLowerCase();
-    const match = games.find(g => {
-      const ht = g.home_team.toLowerCase();
-      const at = g.away_team.toLowerCase();
-      return (ht.includes(homeLower) || homeLower.includes(ht.split(' ')[0])) &&
-             (at.includes(awayLower) || awayLower.includes(at.split(' ')[0]));
+    const r = await fetch(`${ODDS_BASE}/sports/${sport||'soccer_epl'}/odds/?apiKey=${ODDS_KEY}&regions=eu&markets=h2h&oddsFormat=decimal`);
+    const games = await r.json();
+    if (!Array.isArray(games)) return res.json({ found:false });
+    const homeLower=home.toLowerCase(), awayLower=away.toLowerCase();
+    const match = games.find(g=>{const ht=g.home_team.toLowerCase(),at=g.away_team.toLowerCase();return(ht.includes(homeLower)||homeLower.includes(ht.split(' ')[0]))&&(at.includes(awayLower)||awayLower.includes(at.split(' ')[0]));});
+    if (!match) return res.json({ found:false });
+    const bookmakers = [];
+    match.bookmakers.forEach(bm=>{
+      const h2h=bm.markets.find(m=>m.key==='h2h');if(!h2h)return;
+      const ho=h2h.outcomes.find(o=>o.name===match.home_team)?.price, ao=h2h.outcomes.find(o=>o.name===match.away_team)?.price, dr=h2h.outcomes.find(o=>o.name==='Draw')?.price;
+      if(ho&&ao) bookmakers.push({bookmaker:bm.title,key:bm.key,home:+ho.toFixed(2),draw:dr?+dr.toFixed(2):null,away:+ao.toFixed(2)});
     });
-    if (!match) return res.json({ found: false, available_games: games.slice(0,5).map(g=>({home:g.home_team,away:g.away_team})) });
-    const oddsResult = [];
-    match.bookmakers.forEach(bm => {
-      const h2h = bm.markets.find(m => m.key === 'h2h');
-      if (!h2h) return;
-      const homeOdds = h2h.outcomes.find(o => o.name === match.home_team)?.price;
-      const awayOdds = h2h.outcomes.find(o => o.name === match.away_team)?.price;
-      const drawOdds = h2h.outcomes.find(o => o.name === 'Draw')?.price;
-      if (homeOdds && awayOdds) {
-        oddsResult.push({
-          bookmaker: bm.title, key: bm.key,
-          home: parseFloat(homeOdds.toFixed(2)),
-          draw: drawOdds ? parseFloat(drawOdds.toFixed(2)) : null,
-          away: parseFloat(awayOdds.toFixed(2)),
-        });
-      }
-    });
-    res.json({ found: true, home_team: match.home_team, away_team: match.away_team, commence_time: match.commence_time, bookmakers: oddsResult });
-  } catch (err) {
-    res.status(500).json({ error: 'Error Odds API', detail: err.message });
-  }
+    res.json({ found:true, home_team:match.home_team, away_team:match.away_team, commence_time:match.commence_time, bookmakers });
+  } catch(e){res.status(500).json({error:e.message});}
 });
 
-app.get('/odds/sports', async (req, res) => {
-  const ODDS_KEY = process.env.ODDS_API_KEY;
-  if (!ODDS_KEY) return res.status(500).json({ error: 'ODDS_API_KEY no configurada' });
-  try {
-    const r = await fetch(`${ODDS_API_BASE}/sports/?apiKey=${ODDS_KEY}`);
-    const data = await r.json();
-    res.json(data);
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-app.listen(PORT, () => { console.log(`Proxy corriendo en puerto ${PORT}`); });
+app.listen(PORT, () => console.log(`Proxy corriendo en puerto ${PORT}`));
