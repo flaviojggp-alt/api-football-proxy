@@ -6,6 +6,7 @@ const app = express();
 const PORT = process.env.PORT || 8080;
 const AF = 'https://v3.football.api-sports.io';
 const ODDS_BASE = 'https://api.the-odds-api.com/v4';
+const WEATHER_BASE = 'https://api.open-meteo.com/v1/forecast';
 
 app.use(cors());
 app.use(express.json());
@@ -16,201 +17,487 @@ async function af(path) {
   return r.json();
 }
 
-app.get('/', (req, res) => res.json({ status: 'ok', football_key: !!process.env.API_FOOTBALL_KEY, odds_key: !!process.env.ODDS_API_KEY }));
+async function getActiveSeason(teamId) {
+  try {
+    const d = await af(`/leagues?team=${teamId}&current=true&type=League`);
+    const season = d.response?.[0]?.seasons?.find(s => s.current)?.year;
+    if (season) return season;
+  } catch(e) {}
+  const y = new Date().getFullYear();
+  try { const d = await af(`/fixtures?team=${teamId}&season=${y}&last=1&status=FT`); if(d.response?.length) return y; } catch(e) {}
+  return y - 1;
+}
+
+app.get('/', (req, res) => res.json({ status:'ok', football_key:!!process.env.API_FOOTBALL_KEY, odds_key:!!process.env.ODDS_API_KEY }));
 
 // Proxy genérico
 app.get('/api/*', async (req, res) => {
-  if (!process.env.API_FOOTBALL_KEY) return res.status(500).json({ error: 'API_FOOTBALL_KEY no configurada' });
-  const path = req.path.replace('/api', '');
+  if (!process.env.API_FOOTBALL_KEY) return res.status(500).json({ error:'API_FOOTBALL_KEY no configurada' });
+  const path = req.path.replace('/api','');
   const query = new URLSearchParams(req.query).toString();
   try {
-    const r = await fetch(`${AF}${path}${query ? '?' + query : ''}`, { headers: { 'x-apisports-key': process.env.API_FOOTBALL_KEY, 'Accept': 'application/json' } });
+    const r = await fetch(`${AF}${path}${query?'?'+query:''}`, { headers:{'x-apisports-key':process.env.API_FOOTBALL_KEY,'Accept':'application/json'} });
     res.status(r.status).json(await r.json());
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch(e) { res.status(500).json({error:e.message}); }
 });
 
-// Partidos próximos de una liga (próximos 7 días + en vivo + hoy)
+// Partidos próximos con árbitro incluido
 app.get('/fixtures/upcoming', async (req, res) => {
   const { leagueId } = req.query;
-  if (!leagueId) return res.status(400).json({ error: 'Se requiere leagueId' });
-
+  if (!leagueId) return res.status(400).json({ error:'Se requiere leagueId' });
   try {
     const now = new Date();
     const from = now.toISOString().split('T')[0];
-    const to = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
-
-    // Detectar temporada activa automáticamente desde la liga
+    const to = new Date(now.getTime() + 7*24*60*60*1000).toISOString().split('T')[0];
     const leagueInfo = await af(`/leagues?id=${leagueId}&current=true`);
-    const currentSeason = leagueInfo.response?.[0]?.seasons?.find(s => s.current)?.year;
-
-    // Si no hay temporada activa, intentar con el año actual y el anterior
-    const currentYear = now.getFullYear();
-    const seasonsToTry = currentSeason
-      ? [currentSeason]
-      : [currentYear, currentYear - 1];
-
-    let fixtures = [];
-    let usedSeason = null;
-
+    const currentSeason = leagueInfo.response?.[0]?.seasons?.find(s=>s.current)?.year;
+    const y = now.getFullYear();
+    const seasonsToTry = currentSeason ? [currentSeason] : [y, y-1];
+    let fixtures=[], usedSeason=null;
     for (const s of seasonsToTry) {
       const d = await af(`/fixtures?league=${leagueId}&season=${s}&from=${from}&to=${to}&status=NS-1H-2H-HT`);
-      if (d.response?.length) {
-        fixtures = d.response.slice(0, 20);
-        usedSeason = s;
-        break;
-      }
+      if (d.response?.length) { fixtures=d.response.slice(0,20); usedSeason=s; break; }
     }
-
-    // Si aún no hay resultados, buscar sin filtro de fecha (próximos 3 partidos)
     if (!fixtures.length) {
       for (const s of seasonsToTry) {
         const d = await af(`/fixtures?league=${leagueId}&season=${s}&next=10`);
-        if (d.response?.length) {
-          fixtures = d.response.slice(0, 20);
-          usedSeason = s;
-          break;
-        }
+        if (d.response?.length) { fixtures=d.response.slice(0,20); usedSeason=s; break; }
       }
     }
-
     const result = fixtures.map(f => ({
-      fixtureId: f.fixture.id,
-      date: f.fixture.date,
-      timestamp: f.fixture.timestamp,
-      status: f.fixture.status,
-      venue: f.fixture.venue?.name,
-      home: { id: f.teams.home.id, name: f.teams.home.name, logo: f.teams.home.logo },
-      away: { id: f.teams.away.id, name: f.teams.away.name, logo: f.teams.away.logo },
-      score: f.goals,
-      round: f.league.round,
+      fixtureId: f.fixture.id, date: f.fixture.date, timestamp: f.fixture.timestamp,
+      status: f.fixture.status, venue: f.fixture.venue?.name,
+      venueCity: f.fixture.venue?.city,
+      referee: f.fixture.referee || null,
+      home: { id:f.teams.home.id, name:f.teams.home.name, logo:f.teams.home.logo },
+      away: { id:f.teams.away.id, name:f.teams.away.name, logo:f.teams.away.logo },
+      score: f.goals, round: f.league.round,
     }));
-
-    res.json({ fixtures: result, count: result.length, from, to, season: usedSeason });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+    res.json({ fixtures:result, count:result.length, from, to, season:usedSeason });
+  } catch(e) { res.status(500).json({error:e.message}); }
 });
 
-// Lesiones
-app.get('/injuries', async (req, res) => {
-  const { teamId, season } = req.query;
-  if (!teamId) return res.status(400).json({ error: 'Se requiere teamId' });
+// Estadísticas del árbitro
+app.get('/referee', async (req, res) => {
+  const { name, season } = req.query;
+  if (!name) return res.status(400).json({ error:'Se requiere name' });
   try {
-    const d = await af(`/injuries?team=${teamId}&season=${season || '2024'}`);
-    const injuries = (d.response || []).map(i => ({ player: i.player.name, type: i.player.type, reason: i.player.reason, playerId: i.player.id }));
-    res.json({ injuries, count: injuries.length });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+    const s = season || new Date().getFullYear();
+    // Buscar fixtures del árbitro en la temporada actual
+    const d = await af(`/fixtures?referee=${encodeURIComponent(name)}&season=${s}&last=20&status=FT`);
+    const fixtures = d.response || [];
+    if (!fixtures.length) return res.json({ found:false, name });
+
+    let totalCards=0, totalGoals=0, n=0;
+    fixtures.forEach(f => {
+      const hY = f.score?.yellow?.home || 0;
+      const aY = f.score?.yellow?.away || 0;
+      const hR = f.score?.red?.home || 0;
+      const aR = f.score?.red?.away || 0;
+      totalCards += hY + aY + hR + aR;
+      totalGoals += (f.goals?.home||0) + (f.goals?.away||0);
+      n++;
+    });
+
+    // Obtener tarjetas reales desde statistics de cada partido
+    let cardStats = { yellow:0, red:0, total:0, matches:0 };
+    for (const fix of fixtures.slice(0,10)) {
+      try {
+        const sd = await af(`/fixtures/statistics?fixture=${fix.fixture.id}`);
+        const teams = sd.response || [];
+        teams.forEach(t => {
+          const sr = t.statistics || [];
+          const yc = parseFloat(sr.find(s=>s.type==='Yellow Cards')?.value)||0;
+          const rc = parseFloat(sr.find(s=>s.type==='Red Cards')?.value)||0;
+          cardStats.yellow += yc; cardStats.red += rc;
+        });
+        cardStats.matches++;
+      } catch(e) {}
+    }
+
+    const nm = cardStats.matches || n || 1;
+    res.json({
+      found: true, name,
+      matches: n,
+      avgGoals: parseFloat((totalGoals/n).toFixed(2)),
+      avgCards: parseFloat(((cardStats.yellow + cardStats.red) / nm).toFixed(2)),
+      avgYellow: parseFloat((cardStats.yellow / nm).toFixed(2)),
+      avgRed: parseFloat((cardStats.red / nm).toFixed(2)),
+      strictness: cardStats.yellow/nm >= 4.5 ? 'estricto' : cardStats.yellow/nm >= 3.0 ? 'normal' : 'permisivo',
+    });
+  } catch(e) { res.status(500).json({error:e.message}); }
 });
 
-// Alineaciones
-app.get('/lineups', async (req, res) => {
-  const { fixtureId, teamId } = req.query;
-  if (!fixtureId) return res.status(400).json({ error: 'Se requiere fixtureId' });
+// Clima del estadio para la fecha del partido
+app.get('/weather', async (req, res) => {
+  const { lat, lon, date } = req.query;
+  if (!lat || !lon) return res.status(400).json({ error:'Se requieren lat y lon' });
   try {
-    const d = await af(`/fixtures/lineups?fixture=${fixtureId}${teamId ? '&team=' + teamId : ''}`);
-    const lineups = (d.response || []).map(l => ({
-      team: l.team, formation: l.formation,
-      startXI: (l.startXI || []).map(p => ({ id: p.player.id, name: p.player.name, number: p.player.number, pos: p.player.pos, grid: p.player.grid })),
-      substitutes: (l.substitutes || []).map(p => ({ id: p.player.id, name: p.player.name, pos: p.player.pos })),
-    }));
-    res.json({ lineups });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+    const url = `${WEATHER_BASE}?latitude=${lat}&longitude=${lon}&hourly=temperature_2m,precipitation_probability,weathercode&timezone=auto&forecast_days=7`;
+    const r = await fetch(url);
+    const data = await r.json();
+    // Find the hour closest to match date
+    const matchDate = date ? new Date(date) : new Date();
+    const times = data.hourly?.time || [];
+    let closestIdx = 0, minDiff = Infinity;
+    times.forEach((t,i) => {
+      const diff = Math.abs(new Date(t) - matchDate);
+      if (diff < minDiff) { minDiff=diff; closestIdx=i; }
+    });
+    const temp = data.hourly?.temperature_2m?.[closestIdx];
+    const precipProb = data.hourly?.precipitation_probability?.[closestIdx];
+    const wcode = data.hourly?.weathercode?.[closestIdx];
+    // Weather impact on match
+    const isRainy = precipProb > 50 || (wcode >= 51 && wcode <= 99);
+    const isCold = temp < 5;
+    const impact = {
+      temp: temp ? `${temp.toFixed(0)}°C` : null,
+      precipProb: precipProb ? `${precipProb}%` : null,
+      condition: isRainy ? 'lluvia' : isCold ? 'frío' : 'normal',
+      goalsAdj: isRainy ? -0.3 : 0,        // lluvia reduce goles
+      cornersAdj: isRainy ? -0.8 : 0,       // lluvia reduce córners
+      cardsAdj: isRainy ? 0.3 : 0,          // lluvia puede aumentar tarjetas
+    };
+    res.json({ found:true, ...impact });
+  } catch(e) { res.json({ found:false, error:e.message }); }
 });
 
-// Próximo fixture entre dos equipos
-app.get('/next-fixture', async (req, res) => {
-  const { homeId, awayId } = req.query;
-  if (!homeId || !awayId) return res.status(400).json({ error: 'Se requieren homeId y awayId' });
-  try {
-    const d = await af(`/fixtures/headtohead?h2h=${homeId}-${awayId}&next=1`);
-    const fixture = d.response?.[0];
-    if (!fixture) return res.json({ found: false });
-    res.json({ found: true, fixtureId: fixture.fixture.id, date: fixture.fixture.date, venue: fixture.fixture.venue?.name, league: fixture.league });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+// Coordenadas de ciudades conocidas (para clima sin geocoding API)
+app.get('/venue-coords', async (req, res) => {
+  const { city, venue } = req.query;
+  const COORDS = {
+    'madrid': {lat:40.4168,lon:-3.7038}, 'barcelona': {lat:41.3851,lon:2.1734},
+    'london': {lat:51.5074,lon:-0.1278}, 'paris': {lat:48.8566,lon:2.3522},
+    'munich': {lat:48.1351,lon:11.5820}, 'milan': {lat:45.4654,lon:9.1859},
+    'rome': {lat:41.9028,lon:12.4964}, 'berlin': {lat:52.5200,lon:13.4050},
+    'manchester': {lat:53.4808,lon:-2.2426}, 'liverpool': {lat:53.4084,lon:-2.9916},
+    'amsterdam': {lat:52.3676,lon:4.9041}, 'lisbon': {lat:38.7223,lon:-9.1393},
+    'porto': {lat:41.1579,lon:-8.6291}, 'sevilla': {lat:37.3891,lon:-5.9845},
+    'valencia': {lat:39.4699,lon:-0.3763}, 'bilbao': {lat:43.2630,lon:-2.9350},
+    'buenos aires': {lat:-34.6037,lon:-58.3816}, 'sao paulo': {lat:-23.5505,lon:-46.6333},
+    'rio de janeiro': {lat:-22.9068,lon:-43.1729}, 'mexico city': {lat:19.4326,lon:-99.1332},
+    'santiago': {lat:-33.4489,lon:-70.6693}, 'lima': {lat:-12.0464,lon:-77.0428},
+    'dortmund': {lat:51.5136,lon:7.4653}, 'turin': {lat:45.0703,lon:7.6869},
+    'naples': {lat:40.8518,lon:14.2681}, 'lyon': {lat:45.7640,lon:4.8357},
+    'marseille': {lat:43.2965,lon:5.3698},
+  };
+  const key = (city||venue||'').toLowerCase();
+  for (const [k,v] of Object.entries(COORDS)) {
+    if (key.includes(k)) return res.json({ found:true, ...v, city:k });
+  }
+  // Default to Madrid if not found
+  res.json({ found:false, lat:40.4168, lon:-3.7038 });
 });
 
-// Predicciones
-app.get('/predictions', async (req, res) => {
-  const { fixtureId } = req.query;
-  if (!fixtureId) return res.status(400).json({ error: 'Se requiere fixtureId' });
-  try {
-    const d = await af(`/predictions?fixture=${fixtureId}`);
-    const pred = d.response?.[0];
-    if (!pred) return res.json({ found: false });
-    res.json({ found: true, winner: pred.predictions?.winner, winOrDraw: pred.predictions?.win_or_draw, underOver: pred.predictions?.under_over, goals: pred.predictions?.goals, advice: pred.predictions?.advice, percent: pred.predictions?.percent, comparison: pred.comparison });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// Stats avanzadas contextuales
+// Stats avanzadas con forma ponderada + local/visitante separado
 app.get('/stats/advanced', async (req, res) => {
-  if (!process.env.API_FOOTBALL_KEY) return res.status(500).json({ error: 'API_FOOTBALL_KEY no configurada' });
-  const { teamId, opponentId, season } = req.query;
-  if (!teamId || !opponentId) return res.status(400).json({ error: 'Se requieren teamId y opponentId' });
-  const s = season || '2024';
+  if (!process.env.API_FOOTBALL_KEY) return res.status(500).json({ error:'API_FOOTBALL_KEY no configurada' });
+  const { teamId, opponentId, isHome } = req.query;
+  if (!teamId || !opponentId) return res.status(400).json({ error:'Se requieren teamId y opponentId' });
+  const home = isHome === 'true';
   try {
+    const s = await getActiveSeason(teamId);
     const getLeague = async tid => { try { const d=await af(`/leagues?team=${tid}&season=${s}&type=League`); return d.response?.[0]?.league?.id||null; } catch(e){return null;} };
     const getRank = async (tid,lid) => { if(!lid)return null; try { const d=await af(`/standings?league=${lid}&season=${s}&team=${tid}`); const st=d.response?.[0]?.league?.standings?.[0]||[]; return st.find(x=>x.team.id===parseInt(tid))?.rank||null; } catch(e){return null;} };
     const [tL,oL]=await Promise.all([getLeague(teamId),getLeague(opponentId)]);
     const [tR,oR]=await Promise.all([getRank(teamId,tL),getRank(opponentId,oL)]);
     const oTier=!oR?'unknown':oR<=6?'top':oR<=12?'mid':'low';
-    const fixtData=await af(`/fixtures?team=${teamId}&season=${s}&last=10&status=FT`);
-    const fixtures=fixtData?.response||[];
-    const allStats=[],fwdMap={};
-    for(const fix of fixtures.slice(0,10)){
-      const fid=fix.fixture.id,isHome=fix.teams.home.id===parseInt(teamId);
-      const rivalId=isHome?fix.teams.away.id:fix.teams.home.id;
+
+    // Fetch más partidos para filtrar por local/visitante
+    const fixtData = await af(`/fixtures?team=${teamId}&season=${s}&last=20&status=FT`);
+    const allFixtures = fixtData?.response || [];
+
+    // Separar por local/visitante
+    const relevantFixtures = allFixtures.filter(f => {
+      const teamIsHome = f.teams.home.id === parseInt(teamId);
+      return home ? teamIsHome : !teamIsHome;
+    }).slice(0,10);
+
+    // Si no hay suficientes como local/visitante, usar todos
+    const fixtures = relevantFixtures.length >= 5 ? relevantFixtures : allFixtures.slice(0,10);
+    const isFiltered = relevantFixtures.length >= 5;
+
+    const allStats=[], fwdMap={};
+    const now = Date.now();
+
+    for (const fix of fixtures.slice(0,10)) {
+      const fid=fix.fixture.id, isHomeMatch=fix.teams.home.id===parseInt(teamId);
+      const rivalId=isHomeMatch?fix.teams.away.id:fix.teams.home.id;
+      const matchDate = new Date(fix.fixture.date).getTime();
+      const daysAgo = (now - matchDate) / (1000*60*60*24);
+
+      // Peso por recencia: partidos recientes pesan más
+      // Últimos 5 partidos: peso 2.0, anteriores: peso 1.0
+      const recencyWeight = daysAgo <= 45 ? 2.0 : daysAgo <= 90 ? 1.5 : 1.0;
+
       let rR=null;
-      try{const rl=await getLeague(rivalId);if(rl)rR=await getRank(rivalId,rl);}catch(e){}
+      try { const rl=await getLeague(rivalId); if(rl)rR=await getRank(rivalId,rl); } catch(e){}
       const rT=!rR?'unknown':rR<=6?'top':rR<=12?'mid':'low';
-      try{
-        const [sd,pd]=await Promise.all([af(`/fixtures/statistics?fixture=${fid}&team=${teamId}`),af(`/fixtures/players?fixture=${fid}&team=${teamId}`)]);
+
+      try {
+        const [sd,pd]=await Promise.all([
+          af(`/fixtures/statistics?fixture=${fid}&team=${teamId}`),
+          af(`/fixtures/players?fixture=${fid}&team=${teamId}`),
+        ]);
         const sr=sd?.response?.[0]?.statistics||[];
         const getS=t=>parseFloat(sr.find(s=>s.type===t)?.value)||0;
-        allStats.push({rivalTier:rT,rivalRank:rR,isHome,goals:isHome?(fix.score.fulltime.home||0):(fix.score.fulltime.away||0),corners:getS('Corner Kicks'),cards:getS('Yellow Cards')+getS('Red Cards'),shots:getS('Total Shots'),saves:getS('Goalkeeper Saves')});
-        (pd?.response?.[0]?.players||[]).forEach(p=>{
-          if(p.player.pos==='F'||p.player.pos==='A'){const pid=p.player.id,shots=p.statistics?.[0]?.shots?.total||0,goals=p.statistics?.[0]?.goals?.total||0;if(!fwdMap[pid])fwdMap[pid]={name:p.player.name,shots:0,goals:0,games:0};fwdMap[pid].shots+=shots;fwdMap[pid].goals+=goals;fwdMap[pid].games++;}
+        allStats.push({
+          rivalTier:rT, rivalRank:rR, isHome:isHomeMatch,
+          recencyWeight,
+          goals: isHomeMatch?(fix.score.fulltime.home||0):(fix.score.fulltime.away||0),
+          corners: getS('Corner Kicks'),
+          cards: getS('Yellow Cards')+getS('Red Cards'),
+          shots: getS('Total Shots'),
+          saves: getS('Goalkeeper Saves'),
         });
-      }catch(e){}
+        (pd?.response?.[0]?.players||[]).forEach(p=>{
+          if(p.player.pos==='F'||p.player.pos==='A'){
+            const pid=p.player.id, shots=p.statistics?.[0]?.shots?.total||0, goals=p.statistics?.[0]?.goals?.total||0;
+            if(!fwdMap[pid])fwdMap[pid]={name:p.player.name,shots:0,goals:0,games:0,weight:0};
+            fwdMap[pid].shots+=shots*recencyWeight;
+            fwdMap[pid].goals+=goals*recencyWeight;
+            fwdMap[pid].games++;
+            fwdMap[pid].weight+=recencyWeight;
+          }
+        });
+      } catch(e){}
     }
-    const n=allStats.length||1;
-    const avg=k=>allStats.reduce((s,m)=>s+(m[k]||0),0)/n;
-    const byTier=(tier,k)=>{const f=allStats.filter(m=>m.rivalTier===tier);return f.length?f.reduce((s,m)=>s+(m[k]||0),0)/f.length:null;};
-    const ctx=k=>{const t=byTier(oTier,k),g=avg(k);return t!==null?t*0.6+g*0.4:g;};
-    const topForwards=Object.values(fwdMap).filter(f=>f.games>=3).map(f=>{const p=f.name.split(' ');return{name:p.length<=2?f.name:p[0][0]+'. '+p.slice(1).join(' '),shots:f.shots/f.games,goals:f.goals/f.games};}).sort((a,b)=>b.shots-a.shots).slice(0,3);
-    res.json({teamId:parseInt(teamId),teamRank:tR,opponentRank:oR,opponentTier:oTier,sampleSize:n,global:{goals:+avg('goals').toFixed(2),corners:+avg('corners').toFixed(2),cards:+avg('cards').toFixed(2),shots:+avg('shots').toFixed(2),saves:+avg('saves').toFixed(2)},contextual:{goals:+ctx('goals').toFixed(2),corners:+ctx('corners').toFixed(2),cards:+ctx('cards').toFixed(2),shots:+ctx('shots').toFixed(2),saves:+ctx('saves').toFixed(2)},byTier:{top:{goals:byTier('top','goals'),shots:byTier('top','shots'),saves:byTier('top','saves')},mid:{goals:byTier('mid','goals'),shots:byTier('mid','shots'),saves:byTier('mid','saves')},low:{goals:byTier('low','goals'),shots:byTier('low','shots'),saves:byTier('low','saves')}},topForwards});
-  }catch(e){res.status(500).json({error:e.message});}
+
+    // Promedios ponderados por recencia
+    const totalWeight = allStats.reduce((s,m)=>s+m.recencyWeight,0)||1;
+    const wavg = k => allStats.reduce((s,m)=>s+m[k]*m.recencyWeight,0)/totalWeight;
+
+    const byTierW = (tier,k) => {
+      const f=allStats.filter(m=>m.rivalTier===tier);
+      const tw=f.reduce((s,m)=>s+m.recencyWeight,0)||1;
+      return f.length?f.reduce((s,m)=>s+m[k]*m.recencyWeight,0)/tw:null;
+    };
+    const ctx = k => { const t=byTierW(oTier,k),g=wavg(k); return t!==null?t*0.6+g*0.4:g; };
+
+    // Racha de resultados (últimos 5)
+    const last5 = allStats.slice(0,5);
+    const wins = last5.filter(m=>m.goals > 0).length; // simplificado
+    const formGoals = last5.length ? last5.reduce((s,m)=>s+m.goals,0)/last5.length : wavg('goals');
+    const formTrend = formGoals > wavg('goals') * 1.1 ? 'subiendo' : formGoals < wavg('goals') * 0.9 ? 'bajando' : 'estable';
+
+    const topForwards=Object.values(fwdMap).filter(f=>f.games>=3)
+      .map(f=>({name:f.name.split(' ').length<=2?f.name:f.name.split(' ')[0][0]+'. '+f.name.split(' ').slice(1).join(' '),shots:f.shots/f.weight,goals:f.goals/f.weight}))
+      .sort((a,b)=>b.shots-a.shots).slice(0,3);
+
+    res.json({
+      teamId:parseInt(teamId), teamRank:tR, opponentRank:oR, opponentTier:oTier,
+      sampleSize:allStats.length, season:s, isHomeContext:isFiltered?home:null,
+      form:{ trend:formTrend, last5Goals:+formGoals.toFixed(2), overall:+wavg('goals').toFixed(2) },
+      global:{goals:+wavg('goals').toFixed(2),corners:+wavg('corners').toFixed(2),cards:+wavg('cards').toFixed(2),shots:+wavg('shots').toFixed(2),saves:+wavg('saves').toFixed(2)},
+      contextual:{goals:+ctx('goals').toFixed(2),corners:+ctx('corners').toFixed(2),cards:+ctx('cards').toFixed(2),shots:+ctx('shots').toFixed(2),saves:+ctx('saves').toFixed(2)},
+      topForwards,
+    });
+  } catch(e) { res.status(500).json({error:e.message}); }
+});
+
+// Lesiones
+app.get('/injuries', async (req, res) => {
+  const { teamId } = req.query;
+  if (!teamId) return res.status(400).json({ error:'Se requiere teamId' });
+  try {
+    const s = await getActiveSeason(teamId);
+    const d = await af(`/injuries?team=${teamId}&season=${s}`);
+    const injuries=(d.response||[]).map(i=>({player:i.player.name,type:i.player.type,reason:i.player.reason,playerId:i.player.id}));
+    res.json({injuries,count:injuries.length,season:s});
+  } catch(e) { res.status(500).json({error:e.message}); }
+});
+
+// Alineaciones
+app.get('/lineups', async (req, res) => {
+  const { fixtureId, teamId } = req.query;
+  if (!fixtureId) return res.status(400).json({ error:'Se requiere fixtureId' });
+  try {
+    const d = await af(`/fixtures/lineups?fixture=${fixtureId}${teamId?'&team='+teamId:''}`);
+    const lineups=(d.response||[]).map(l=>({team:l.team,formation:l.formation,startXI:(l.startXI||[]).map(p=>({id:p.player.id,name:p.player.name,number:p.player.number,pos:p.player.pos,grid:p.player.grid})),substitutes:(l.substitutes||[]).map(p=>({id:p.player.id,name:p.player.name,pos:p.player.pos}))}));
+    res.json({lineups});
+  } catch(e) { res.status(500).json({error:e.message}); }
+});
+
+// Predicciones
+app.get('/predictions', async (req, res) => {
+  const { fixtureId } = req.query;
+  if (!fixtureId) return res.status(400).json({ error:'Se requiere fixtureId' });
+  try {
+    const d = await af(`/predictions?fixture=${fixtureId}`);
+    const pred=d.response?.[0];
+    if(!pred) return res.json({found:false});
+    res.json({found:true,winner:pred.predictions?.winner,winOrDraw:pred.predictions?.win_or_draw,underOver:pred.predictions?.under_over,goals:pred.predictions?.goals,advice:pred.predictions?.advice,percent:pred.predictions?.percent,comparison:pred.comparison});
+  } catch(e) { res.status(500).json({error:e.message}); }
 });
 
 // H2H
 app.get('/h2h', async (req, res) => {
   const { home, away, last } = req.query;
-  if (!home||!away) return res.status(400).json({ error: 'Se requieren home y away' });
+  if (!home||!away) return res.status(400).json({ error:'Se requieren home y away' });
   try {
     const data=await af(`/fixtures/headtohead?h2h=${home}-${away}&last=${last||10}&status=FT`);
     const enriched=[];
     for(const fix of(data.response||[]).slice(0,10)){
-      try{const [sH,sA]=await Promise.all([af(`/fixtures/statistics?fixture=${fix.fixture.id}&team=${home}`),af(`/fixtures/statistics?fixture=${fix.fixture.id}&team=${away}`)]);enriched.push({fixture:fix.fixture,teams:fix.teams,score:fix.score,league:fix.league,statsHome:sH.response?.[0]?.statistics||[],statsAway:sA.response?.[0]?.statistics||[]});}
-      catch(e){enriched.push({fixture:fix.fixture,teams:fix.teams,score:fix.score,league:fix.league,statsHome:[],statsAway:[]});}
+      try {
+        const [sH,sA]=await Promise.all([af(`/fixtures/statistics?fixture=${fix.fixture.id}&team=${home}`),af(`/fixtures/statistics?fixture=${fix.fixture.id}&team=${away}`)]);
+        enriched.push({fixture:fix.fixture,teams:fix.teams,score:fix.score,league:fix.league,statsHome:sH.response?.[0]?.statistics||[],statsAway:sA.response?.[0]?.statistics||[]});
+      } catch(e){enriched.push({fixture:fix.fixture,teams:fix.teams,score:fix.score,league:fix.league,statsHome:[],statsAway:[]});}
     }
     res.json({response:enriched,results:enriched.length});
-  }catch(e){res.status(500).json({error:e.message});}
+  } catch(e) { res.status(500).json({error:e.message}); }
 });
 
 // Odds
 app.get('/odds/match', async (req, res) => {
   const ODDS_KEY=process.env.ODDS_API_KEY;
-  if(!ODDS_KEY)return res.status(500).json({error:'ODDS_API_KEY no configurada'});
+  if(!ODDS_KEY) return res.status(500).json({error:'ODDS_API_KEY no configurada'});
   const{home,away,sport}=req.query;
-  if(!home||!away)return res.status(400).json({error:'Se requieren home y away'});
-  try{
+  if(!home||!away) return res.status(400).json({error:'Se requieren home y away'});
+  try {
     const r=await fetch(`${ODDS_BASE}/sports/${sport||'soccer_epl'}/odds/?apiKey=${ODDS_KEY}&regions=eu&markets=h2h&oddsFormat=decimal`);
     const games=await r.json();
-    if(!Array.isArray(games))return res.json({found:false});
+    if(!Array.isArray(games)) return res.json({found:false});
     const hL=home.toLowerCase(),aL=away.toLowerCase();
     const match=games.find(g=>{const ht=g.home_team.toLowerCase(),at=g.away_team.toLowerCase();return(ht.includes(hL)||hL.includes(ht.split(' ')[0]))&&(at.includes(aL)||aL.includes(at.split(' ')[0]));});
-    if(!match)return res.json({found:false});
+    if(!match) return res.json({found:false});
     const bookmakers=[];
     match.bookmakers.forEach(bm=>{const h2h=bm.markets.find(m=>m.key==='h2h');if(!h2h)return;const ho=h2h.outcomes.find(o=>o.name===match.home_team)?.price,ao=h2h.outcomes.find(o=>o.name===match.away_team)?.price,dr=h2h.outcomes.find(o=>o.name==='Draw')?.price;if(ho&&ao)bookmakers.push({bookmaker:bm.title,key:bm.key,home:+ho.toFixed(2),draw:dr?+dr.toFixed(2):null,away:+ao.toFixed(2)});});
     res.json({found:true,home_team:match.home_team,away_team:match.away_team,commence_time:match.commence_time,bookmakers});
-  }catch(e){res.status(500).json({error:e.message});}
+  } catch(e) { res.status(500).json({error:e.message}); }
+});
+
+
+// Importancia del partido — analiza posición en tabla y ronda
+app.get('/match-importance', async (req, res) => {
+  const { homeId, awayId, leagueId, round } = req.query;
+  if (!homeId || !awayId) return res.status(400).json({ error: 'Se requieren homeId y awayId' });
+  try {
+    const s = await getActiveSeason(homeId);
+    const lid = leagueId || await (async () => {
+      try { const d=await af(`/leagues?team=${homeId}&season=${s}&type=League`); return d.response?.[0]?.league?.id||null; } catch(e){return null;}
+    })();
+
+    let homeRank=null, awayRank=null, totalTeams=20;
+    if (lid) {
+      try {
+        const std = await af(`/standings?league=${lid}&season=${s}`);
+        const standings = std.response?.[0]?.league?.standings?.[0] || [];
+        totalTeams = standings.length || 20;
+        homeRank = standings.find(x=>x.team.id===parseInt(homeId))?.rank || null;
+        awayRank = standings.find(x=>x.team.id===parseInt(awayId))?.rank || null;
+      } catch(e) {}
+    }
+
+    // Detectar importancia
+    const relegationZone = Math.floor(totalTeams * 0.85); // último 15%
+    const titleRace = 3; // top 3
+    const euroZone = 6;  // top 6
+
+    const homeRelegation = homeRank && homeRank >= relegationZone;
+    const awayRelegation = awayRank && awayRank >= relegationZone;
+    const homeTitleRace = homeRank && homeRank <= titleRace;
+    const awayTitleRace = awayRank && awayRank <= titleRace;
+    const homeEuro = homeRank && homeRank <= euroZone;
+    const awayEuro = awayRank && awayRank <= euroZone;
+
+    // Detectar si es jornada final (round contiene números altos)
+    const roundNum = round ? parseInt(round.replace(/\D/g,'')) : null;
+    const isLateStage = roundNum && roundNum >= (totalTeams - 2) * 2 - 6;
+    const isDerby = false; // podría detectarse por ciudad en futuras versiones
+
+    // Calcular nivel de importancia
+    let importance = 'normal';
+    let intensityBoost = 0; // boost para tarjetas
+    let goalsBoost = 0;
+    let notes = [];
+
+    if (homeRelegation || awayRelegation) {
+      importance = 'alta';
+      intensityBoost = 0.8;
+      goalsBoost = 0.2;
+      if (homeRelegation) notes.push(`${homeRelegation?'Local':'Visitante'} pelea por no descender (pos.${homeRank}/${totalTeams})`);
+      if (awayRelegation) notes.push(`Visitante pelea por no descender (pos.${awayRank}/${totalTeams})`);
+    }
+    if (homeTitleRace && awayTitleRace) {
+      importance = 'muy alta';
+      intensityBoost = 1.0;
+      goalsBoost = 0.3;
+      notes.push(`Duelo entre equipos top (pos.${homeRank} vs pos.${awayRank})`);
+    } else if (homeTitleRace || awayTitleRace) {
+      importance = importance === 'alta' ? 'muy alta' : 'alta';
+      intensityBoost = Math.max(intensityBoost, 0.6);
+      notes.push(`Equipo en lucha por el título involucrado`);
+    }
+    if (isLateStage) {
+      importance = importance === 'normal' ? 'alta' : 'muy alta';
+      intensityBoost += 0.4;
+      notes.push(`Jornada final de temporada (jornada ${roundNum})`);
+    }
+    if (homeEuro && awayEuro && importance === 'normal') {
+      importance = 'media-alta';
+      intensityBoost = 0.4;
+      notes.push(`Ambos equipos pelean por zona europea`);
+    }
+
+    res.json({
+      importance, intensityBoost, goalsBoost,
+      homeRank, awayRank, totalTeams,
+      homeRelegation, awayRelegation,
+      homeTitleRace, awayTitleRace,
+      isLateStage, notes,
+    });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Minutos de goles — analiza patrones temporales de los últimos 10 partidos
+app.get('/goal-minutes', async (req, res) => {
+  const { teamId } = req.query;
+  if (!teamId) return res.status(400).json({ error: 'Se requiere teamId' });
+  try {
+    const s = await getActiveSeason(teamId);
+    const fixtData = await af(`/fixtures?team=${teamId}&season=${s}&last=10&status=FT`);
+    const fixtures = fixtData?.response || [];
+
+    let firstHalfGoals=0, secondHalfGoals=0, last15Goals=0, first15Goals=0;
+    let matchesWithGoal1H=0, matchesWithGoal2H=0, matchesWithGoalLast15=0;
+    let totalMatches=0;
+
+    for (const fix of fixtures.slice(0,10)) {
+      try {
+        const events = await af(`/fixtures/events?fixture=${fix.fixture.id}&team=${teamId}&type=Goal`);
+        const goals = events.response || [];
+        totalMatches++;
+        let has1H=false, has2H=false, hasLast15=false, hasFirst15=false;
+        goals.forEach(g => {
+          const min = g.time?.elapsed || 0;
+          const isOwnGoal = g.detail === 'Own Goal';
+          if (!isOwnGoal) {
+            if (min <= 45) { firstHalfGoals++; has1H=true; }
+            else { secondHalfGoals++; has2H=true; }
+            if (min >= 75) { last15Goals++; hasLast15=true; }
+            if (min <= 15) { first15Goals++; hasFirst15=true; }
+          }
+        });
+        if(has1H) matchesWithGoal1H++;
+        if(has2H) matchesWithGoal2H++;
+        if(hasLast15) matchesWithGoalLast15++;
+      } catch(e) {}
+    }
+
+    const n = totalMatches || 1;
+    res.json({
+      teamId: parseInt(teamId),
+      totalMatches: n,
+      firstHalfRate: parseFloat((matchesWithGoal1H/n).toFixed(2)),
+      secondHalfRate: parseFloat((matchesWithGoal2H/n).toFixed(2)),
+      last15Rate: parseFloat((matchesWithGoalLast15/n).toFixed(2)),
+      avgFirst15Goals: parseFloat((first15Goals/n).toFixed(2)),
+      avgLast15Goals: parseFloat((last15Goals/n).toFixed(2)),
+      avgFirstHalfGoals: parseFloat((firstHalfGoals/n).toFixed(2)),
+      avgSecondHalfGoals: parseFloat((secondHalfGoals/n).toFixed(2)),
+      scoringPattern: firstHalfGoals > secondHalfGoals ? 'primer tiempo' : secondHalfGoals > firstHalfGoals*1.3 ? 'segundo tiempo' : 'distribuido',
+    });
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 app.listen(PORT, () => console.log(`Proxy corriendo en puerto ${PORT}`));
