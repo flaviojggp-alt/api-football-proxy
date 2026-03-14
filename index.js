@@ -500,4 +500,244 @@ app.get('/goal-minutes', async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
+
+// Fatiga de calendario / rotación — detecta partidos importantes próximos
+app.get('/schedule-fatigue', async (req, res) => {
+  const { teamId, matchDate } = req.query;
+  if (!teamId) return res.status(400).json({ error: 'Se requiere teamId' });
+  try {
+    const s = await getActiveSeason(teamId);
+    const targetDate = matchDate ? new Date(matchDate) : new Date();
+
+    // Partidos de los próximos 10 días y últimos 5 días
+    const [nextFixtures, prevFixtures] = await Promise.all([
+      af(`/fixtures?team=${teamId}&next=5`),
+      af(`/fixtures?team=${teamId}&last=5&status=FT`),
+    ]);
+
+    const upcomingAll = nextFixtures?.response || [];
+    const recentAll = prevFixtures?.response || [];
+
+    // Competiciones de alta importancia
+    const HIGH_COMP = [
+      'UEFA Champions League', 'UEFA Europa League', 'UEFA Conference League',
+      'Copa del Rey', 'FA Cup', 'DFB Pokal', 'Coppa Italia', 'Coupe de France',
+      'Copa Libertadores', 'Copa Sudamericana', 'FIFA Club World Cup',
+      'UEFA Super Cup', 'World Cup', 'CONMEBOL',
+    ];
+    const isHighComp = name => HIGH_COMP.some(c => (name||'').includes(c));
+
+    // Buscar partidos importantes en los próximos 7 días
+    const importantUpcoming = upcomingAll.filter(f => {
+      const fDate = new Date(f.fixture.date);
+      const daysAway = (fDate - targetDate) / (1000*60*60*24);
+      return daysAway > 0 && daysAway <= 7 && isHighComp(f.league.name);
+    }).map(f => ({
+      fixtureId: f.fixture.id,
+      date: f.fixture.date,
+      daysAway: Math.round((new Date(f.fixture.date) - targetDate) / (1000*60*60*24)),
+      league: f.league.name,
+      round: f.league.round,
+      opponent: f.teams.home.id === parseInt(teamId) ? f.teams.away.name : f.teams.home.name,
+      isHome: f.teams.home.id === parseInt(teamId),
+    }));
+
+    // Buscar partidos jugados en los últimos 4 días (fatiga)
+    const recentHighComp = recentAll.filter(f => {
+      const fDate = new Date(f.fixture.date);
+      const daysAgo = (targetDate - fDate) / (1000*60*60*24);
+      return daysAgo >= 0 && daysAgo <= 4 && isHighComp(f.league.name);
+    }).map(f => ({
+      date: f.fixture.date,
+      daysAgo: Math.round((targetDate - new Date(f.fixture.date)) / (1000*60*60*24)),
+      league: f.league.name,
+      opponent: f.teams.home.id === parseInt(teamId) ? f.teams.away.name : f.teams.home.name,
+    }));
+
+    // Calcular nivel de rotación esperada
+    let rotationLevel = 'none';
+    let goalsAdj = 0, shotsAdj = 0, cornersAdj = 0, cardsAdj = 0, confidenceAdj = 0;
+    let notes = [];
+
+    // Fatiga por partido reciente (jugó hace 3-4 días)
+    if (recentHighComp.length > 0) {
+      const recent = recentHighComp[0];
+      rotationLevel = 'fatigue';
+      goalsAdj = -0.2;
+      shotsAdj = -0.10;
+      cornersAdj = -0.5;
+      cardsAdj = 0.2;
+      confidenceAdj = -3;
+      notes.push(`Jugó ${recent.league} hace ${recent.daysAgo} día(s) vs ${recent.opponent}`);
+    }
+
+    // Rotación por partido importante próximo
+    if (importantUpcoming.length > 0) {
+      const next = importantUpcoming[0];
+      const isKnockout = (next.round||'').toLowerCase().includes('final') ||
+                         (next.round||'').toLowerCase().includes('octavo') ||
+                         (next.round||'').toLowerCase().includes('cuarto') ||
+                         (next.round||'').toLowerCase().includes('semi') ||
+                         (next.round||'').toLowerCase().includes('round of') ||
+                         (next.round||'').toLowerCase().includes('knockout');
+
+      const rotAdj = next.daysAway <= 3 ? 1.5 : next.daysAway <= 5 ? 1.0 : 0.6;
+      const knockoutMult = isKnockout ? 1.4 : 1.0;
+
+      rotationLevel = isKnockout && next.daysAway <= 5 ? 'high' : 'moderate';
+      goalsAdj += -0.3 * rotAdj * knockoutMult;
+      shotsAdj += -0.12 * rotAdj;
+      cornersAdj += -0.8 * rotAdj;
+      cardsAdj += 0.3 * rotAdj;
+      confidenceAdj += -5 * rotAdj;
+
+      notes.push(`${isKnockout?'⚽ Eliminatoria':'Partido'} de ${next.league} en ${next.daysAway} día(s) vs ${next.opponent}${isKnockout?' — rotación probable':''}`);
+    }
+
+    res.json({
+      teamId: parseInt(teamId),
+      rotationLevel,
+      hasUpcomingImportant: importantUpcoming.length > 0,
+      hasRecentFatigue: recentHighComp.length > 0,
+      upcomingMatches: importantUpcoming,
+      recentMatches: recentHighComp,
+      adjustments: {
+        goals: parseFloat(goalsAdj.toFixed(2)),
+        shots: parseFloat(shotsAdj.toFixed(2)),
+        corners: parseFloat(cornersAdj.toFixed(2)),
+        cards: parseFloat(cardsAdj.toFixed(2)),
+        confidence: parseFloat(confidenceAdj.toFixed(1)),
+      },
+      notes,
+    });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+
+// Estadísticas defensivas del rival — cuánto permite generar el equipo rival
+app.get('/stats/defensive', async (req, res) => {
+  const { teamId } = req.query;
+  if (!teamId) return res.status(400).json({ error: 'Se requiere teamId' });
+  try {
+    const s = await getActiveSeason(teamId);
+    const fixtData = await af(`/fixtures?team=${teamId}&season=${s}&last=10&status=FT`);
+    const fixtures = fixtData?.response || [];
+    const defStats = { goalsAgainst:0, shotsAgainst:0, cornersAgainst:0, savesFor:0, n:0 };
+
+    for (const fix of fixtures.slice(0,10)) {
+      const fid = fix.fixture.id;
+      const isHome = fix.teams.home.id === parseInt(teamId);
+      const rivalId = isHome ? fix.teams.away.id : fix.teams.home.id;
+      try {
+        const sd = await af(`/fixtures/statistics?fixture=${fid}&team=${rivalId}`);
+        const sr = sd?.response?.[0]?.statistics || [];
+        const getS = t => parseFloat(sr.find(s=>s.type===t)?.value)||0;
+        defStats.goalsAgainst += isHome?(fix.score.fulltime.away||0):(fix.score.fulltime.home||0);
+        defStats.shotsAgainst += getS('Total Shots');
+        defStats.cornersAgainst += getS('Corner Kicks');
+        defStats.savesFor += getS('Goalkeeper Saves');
+        defStats.n++;
+      } catch(e) {}
+    }
+    const n = defStats.n || 1;
+    res.json({
+      teamId: parseInt(teamId),
+      avgGoalsAgainst: +(defStats.goalsAgainst/n).toFixed(2),
+      avgShotsAgainst: +(defStats.shotsAgainst/n).toFixed(2),
+      avgCornersAgainst: +(defStats.cornersAgainst/n).toFixed(2),
+      avgSavesFor: +(defStats.savesFor/n).toFixed(2),
+      defensiveRating: defStats.goalsAgainst/n <= 0.8 ? 'elite' : defStats.goalsAgainst/n <= 1.2 ? 'solida' : defStats.goalsAgainst/n <= 1.8 ? 'media' : 'debil',
+    });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// xG — goles esperados desde statistics de los últimos partidos
+app.get('/xg', async (req, res) => {
+  const { teamId } = req.query;
+  if (!teamId) return res.status(400).json({ error: 'Se requiere teamId' });
+  try {
+    const s = await getActiveSeason(teamId);
+    const fixtData = await af(`/fixtures?team=${teamId}&season=${s}&last=10&status=FT`);
+    const fixtures = fixtData?.response || [];
+    let totalXG=0, totalGoals=0, n=0;
+
+    for (const fix of fixtures.slice(0,10)) {
+      const fid = fix.fixture.id;
+      const isHome = fix.teams.home.id === parseInt(teamId);
+      try {
+        const sd = await af(`/fixtures/statistics?fixture=${fid}&team=${teamId}`);
+        const sr = sd?.response?.[0]?.statistics || [];
+        // API-Football incluye xG en algunos partidos
+        const xg = parseFloat(sr.find(s=>s.type==='expected_goals'||s.type==='xG')?.value) || null;
+        const shots = parseFloat(sr.find(s=>s.type==='Total Shots')?.value)||0;
+        const shotsOnTarget = parseFloat(sr.find(s=>s.type==='Shots on Goal')?.value)||0;
+        const goals = isHome?(fix.score.fulltime.home||0):(fix.score.fulltime.away||0);
+        // Si no hay xG nativo, estimarlo: xG ≈ shots_on_target * 0.33 + (shots-shots_on_target)*0.05
+        const estimatedXG = xg !== null ? xg : shotsOnTarget*0.33 + (shots-shotsOnTarget)*0.05;
+        totalXG += estimatedXG;
+        totalGoals += goals;
+        n++;
+      } catch(e) {}
+    }
+    const nm = n||1;
+    const avgXG = totalXG/nm;
+    const avgGoals = totalGoals/nm;
+    const xgOverPerformance = avgGoals - avgXG; // positivo = suerte, negativo = mala suerte
+    res.json({
+      teamId: parseInt(teamId),
+      avgXG: +avgXG.toFixed(2),
+      avgGoals: +avgGoals.toFixed(2),
+      xgOverPerformance: +xgOverPerformance.toFixed(2),
+      trend: xgOverPerformance > 0.3 ? 'sobrerendimiento' : xgOverPerformance < -0.3 ? 'infrarendimiento' : 'normal',
+      sampleSize: n,
+    });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Comparación de cuotas entre casas de apuestas
+app.get('/odds/compare', async (req, res) => {
+  const ODDS_KEY = process.env.ODDS_API_KEY;
+  if (!ODDS_KEY) return res.status(500).json({ error: 'ODDS_API_KEY no configurada' });
+  const { home, away, sport, market } = req.query;
+  if (!home||!away) return res.status(400).json({ error: 'Se requieren home y away' });
+  try {
+    const markets = market || 'h2h,totals';
+    const r = await fetch(`${ODDS_BASE}/sports/${sport||'soccer_epl'}/odds/?apiKey=${ODDS_KEY}&regions=eu,uk&markets=${markets}&oddsFormat=decimal`);
+    const games = await r.json();
+    if (!Array.isArray(games)) return res.json({ found:false });
+    const hL=home.toLowerCase(), aL=away.toLowerCase();
+    const match = games.find(g=>{
+      const ht=g.home_team.toLowerCase(), at=g.away_team.toLowerCase();
+      return (ht.includes(hL)||hL.includes(ht.split(' ')[0]))&&(at.includes(aL)||aL.includes(at.split(' ')[0]));
+    });
+    if (!match) return res.json({ found:false });
+
+    // Agrupar por mercado y bookmaker
+    const comparison = {};
+    match.bookmakers.forEach(bm => {
+      bm.markets.forEach(mkt => {
+        if (!comparison[mkt.key]) comparison[mkt.key] = { market: mkt.key, bookmakers: [] };
+        const outcomes = {};
+        mkt.outcomes.forEach(o => { outcomes[o.name] = o.price; });
+        comparison[mkt.key].bookmakers.push({ name: bm.title, outcomes });
+      });
+    });
+
+    // Encontrar mejor cuota por resultado
+    const bestOdds = {};
+    Object.values(comparison).forEach(mkt => {
+      mkt.bookmakers.forEach(bm => {
+        Object.entries(bm.outcomes).forEach(([name, price]) => {
+          const key = `${mkt.market}:${name}`;
+          if (!bestOdds[key] || price > bestOdds[key].price) {
+            bestOdds[key] = { price, bookmaker: bm.name, market: mkt.market, outcome: name };
+          }
+        });
+      });
+    });
+
+    res.json({ found:true, home_team:match.home_team, away_team:match.away_team, comparison, bestOdds:Object.values(bestOdds) });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 app.listen(PORT, () => console.log(`Proxy corriendo en puerto ${PORT}`));
