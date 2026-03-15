@@ -740,4 +740,302 @@ app.get('/odds/compare', async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
+
+// Modelo Poisson — probabilidades exactas por resultado
+app.get('/poisson', async (req, res) => {
+  const { homeLambda, awayLambda } = req.query;
+  if (!homeLambda || !awayLambda) return res.status(400).json({ error: 'Se requieren homeLambda y awayLambda' });
+  try {
+    const hL = parseFloat(homeLambda);
+    const aL = parseFloat(awayLambda);
+
+    // Factorial helper
+    const fact = n => { let r=1; for(let i=2;i<=n;i++) r*=i; return r; };
+    // Poisson PMF: P(X=k) = e^-λ * λ^k / k!
+    const poisson = (lambda, k) => Math.exp(-lambda) * Math.pow(lambda,k) / fact(k);
+
+    // Calcular matriz de probabilidades hasta 6 goles por equipo
+    const maxGoals = 7;
+    let homeWin=0, draw=0, awayWin=0;
+    let over05=0, over15=0, over25=0, over35=0;
+    let btts=0, bttsNo=0;
+    let homeOver05=0, homeOver15=0, homeOver25=0;
+    let awayOver05=0, awayOver15=0, awayOver25=0;
+    const matrix = [];
+
+    for(let h=0; h<maxGoals; h++){
+      for(let a=0; a<maxGoals; a++){
+        const p = poisson(hL,h) * poisson(aL,a);
+        matrix.push({h,a,p:+p.toFixed(6)});
+        const total = h+a;
+        if(h>a) homeWin+=p;
+        else if(h===a) draw+=p;
+        else awayWin+=p;
+        if(total>0.5) over05+=p;
+        if(total>1.5) over15+=p;
+        if(total>2.5) over25+=p;
+        if(total>3.5) over35+=p;
+        if(h>0&&a>0) btts+=p;
+        else bttsNo+=p;
+        if(h>0.5) homeOver05+=p;
+        if(h>1.5) homeOver15+=p;
+        if(h>2.5) homeOver25+=p;
+        if(a>0.5) awayOver05+=p;
+        if(a>1.5) awayOver15+=p;
+        if(a>2.5) awayOver25+=p;
+      }
+    }
+
+    // Fair odds = 1/probability
+    const fairOdds = p => p>0 ? +(1/p).toFixed(2) : null;
+
+    res.json({
+      probabilities: {
+        homeWin: +homeWin.toFixed(4),
+        draw: +draw.toFixed(4),
+        awayWin: +awayWin.toFixed(4),
+        over05: +over05.toFixed(4),
+        over15: +over15.toFixed(4),
+        over25: +over25.toFixed(4),
+        over35: +over35.toFixed(4),
+        btts: +btts.toFixed(4),
+        bttsNo: +bttsNo.toFixed(4),
+        homeOver05: +homeOver05.toFixed(4),
+        homeOver15: +homeOver15.toFixed(4),
+        homeOver25: +homeOver25.toFixed(4),
+        awayOver05: +awayOver05.toFixed(4),
+        awayOver15: +awayOver15.toFixed(4),
+        awayOver25: +awayOver25.toFixed(4),
+      },
+      fairOdds: {
+        homeWin: fairOdds(homeWin),
+        draw: fairOdds(draw),
+        awayWin: fairOdds(awayWin),
+        over25: fairOdds(over25),
+        btts: fairOdds(btts),
+        homeOver15: fairOdds(homeOver15),
+        awayOver15: fairOdds(awayOver15),
+      },
+      topScenarios: matrix.sort((a,b)=>b.p-a.p).slice(0,6),
+      lambdas: { home: hL, away: aL },
+    });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Movimiento de cuotas — apertura vs cierre
+app.get('/odds/movement', async (req, res) => {
+  const ODDS_KEY = process.env.ODDS_API_KEY;
+  if (!ODDS_KEY) return res.status(500).json({ error: 'ODDS_API_KEY no configurada' });
+  const { home, away, sport } = req.query;
+  if (!home||!away) return res.status(400).json({ error: 'Se requieren home y away' });
+  try {
+    // The Odds API historical endpoint para odds de apertura
+    const [currentR, historicalR] = await Promise.all([
+      fetch(`${ODDS_BASE}/sports/${sport||'soccer_epl'}/odds/?apiKey=${ODDS_KEY}&regions=eu&markets=h2h&oddsFormat=decimal`),
+      fetch(`${ODDS_BASE}/sports/${sport||'soccer_epl'}/odds/?apiKey=${ODDS_KEY}&regions=eu&markets=h2h&oddsFormat=decimal&dateFormat=iso`),
+    ]);
+    const current = await currentR.json();
+    if (!Array.isArray(current)) return res.json({ found:false });
+
+    const hL=home.toLowerCase(), aL=away.toLowerCase();
+    const match = current.find(g=>{
+      const ht=g.home_team.toLowerCase(), at=g.away_team.toLowerCase();
+      return (ht.includes(hL)||hL.includes(ht.split(' ')[0]))&&(at.includes(aL)||aL.includes(at.split(' ')[0]));
+    });
+    if (!match) return res.json({ found:false });
+
+    // Extraer cuotas actuales y detectar movimiento
+    const movements = [];
+    match.bookmakers.forEach(bm => {
+      const h2h = bm.markets.find(m=>m.key==='h2h');
+      if (!h2h) return;
+      const lastUpdate = new Date(h2h.last_update);
+      const homeOdds = h2h.outcomes.find(o=>o.name===match.home_team);
+      const awayOdds = h2h.outcomes.find(o=>o.name===match.away_team);
+      const drawOdds = h2h.outcomes.find(o=>o.name==='Draw');
+      if (homeOdds) {
+        movements.push({
+          bookmaker: bm.title,
+          lastUpdate: h2h.last_update,
+          home: homeOdds.price,
+          draw: drawOdds?.price||null,
+          away: awayOdds?.price||null,
+        });
+      }
+    });
+
+    // Detectar consenso del mercado
+    const avgHome = movements.reduce((s,m)=>s+m.home,0)/movements.length;
+    const avgAway = movements.reduce((s,m)=>s+(m.away||0),0)/movements.length;
+    const avgDraw = movements.reduce((s,m)=>s+(m.draw||0),0)/movements.length;
+    const impliedHome = 1/avgHome;
+    const impliedAway = 1/avgAway;
+    const impliedDraw = 1/avgDraw;
+    const totalImplied = impliedHome+impliedAway+impliedDraw;
+
+    res.json({
+      found: true,
+      home_team: match.home_team,
+      away_team: match.away_team,
+      marketConsensus: {
+        homeWinProb: +(impliedHome/totalImplied).toFixed(4),
+        drawProb: +(impliedDraw/totalImplied).toFixed(4),
+        awayWinProb: +(impliedAway/totalImplied).toFixed(4),
+        avgHomeOdds: +avgHome.toFixed(2),
+        avgDrawOdds: +avgDraw.toFixed(2),
+        avgAwayOdds: +avgAway.toFixed(2),
+        bookmakerCount: movements.length,
+        favorite: impliedHome>impliedAway ? match.home_team : match.away_team,
+      },
+      bookmakers: movements,
+    });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Handicap asiático — cuotas y análisis
+app.get('/odds/asian', async (req, res) => {
+  const ODDS_KEY = process.env.ODDS_API_KEY;
+  if (!ODDS_KEY) return res.status(500).json({ error: 'ODDS_API_KEY no configurada' });
+  const { home, away, sport } = req.query;
+  if (!home||!away) return res.status(400).json({ error: 'Se requieren home y away' });
+  try {
+    const r = await fetch(`${ODDS_BASE}/sports/${sport||'soccer_epl'}/odds/?apiKey=${ODDS_KEY}&regions=eu,uk&markets=asian_handicap,totals&oddsFormat=decimal`);
+    const games = await r.json();
+    if (!Array.isArray(games)) return res.json({ found:false });
+    const hL=home.toLowerCase(), aL=away.toLowerCase();
+    const match = games.find(g=>{
+      const ht=g.home_team.toLowerCase(), at=g.away_team.toLowerCase();
+      return (ht.includes(hL)||hL.includes(ht.split(' ')[0]))&&(at.includes(aL)||aL.includes(at.split(' ')[0]));
+    });
+    if (!match) return res.json({ found:false });
+
+    const ahMarkets = [], totalsMarkets = [];
+    match.bookmakers.forEach(bm => {
+      bm.markets.forEach(mkt => {
+        if (mkt.key==='asian_handicap') {
+          mkt.outcomes.forEach(o => {
+            ahMarkets.push({ bookmaker:bm.title, name:o.name, point:o.point, price:o.price });
+          });
+        }
+        if (mkt.key==='totals') {
+          mkt.outcomes.forEach(o => {
+            totalsMarkets.push({ bookmaker:bm.title, name:o.name, point:o.point, price:o.price });
+          });
+        }
+      });
+    });
+
+    // Detectar línea asiática más ofrecida (consenso)
+    const ahPoints = {};
+    ahMarkets.forEach(m => {
+      const key = `${m.point}`;
+      if (!ahPoints[key]) ahPoints[key] = {point:m.point, count:0, avgPrice:0, prices:[]};
+      ahPoints[key].count++;
+      ahPoints[key].prices.push(m.price);
+    });
+    Object.values(ahPoints).forEach(p => { p.avgPrice = +(p.prices.reduce((s,v)=>s+v,0)/p.prices.length).toFixed(2); });
+    const consensusAH = Object.values(ahPoints).sort((a,b)=>b.count-a.count).slice(0,3);
+
+    // Totals consensus
+    const totalsPoints = {};
+    totalsMarkets.forEach(m => {
+      const key = `${m.point}`;
+      if (!totalsPoints[key]) totalsPoints[key]={point:m.point,over:[],under:[]};
+      if(m.name==='Over') totalsPoints[key].over.push(m.price);
+      else totalsPoints[key].under.push(m.price);
+    });
+    const totalsSummary = Object.values(totalsPoints).map(t=>({
+      point:t.point,
+      avgOver:t.over.length?+(t.over.reduce((s,v)=>s+v,0)/t.over.length).toFixed(2):null,
+      avgUnder:t.under.length?+(t.under.reduce((s,v)=>s+v,0)/t.under.length).toFixed(2):null,
+      impliedOver:t.over.length?+(1/(t.over.reduce((s,v)=>s+v,0)/t.over.length)).toFixed(3):null,
+    })).sort((a,b)=>a.point-b.point);
+
+    res.json({ found:true, home_team:match.home_team, away_team:match.away_team, consensusAH, totalsSummary, ahMarkets:ahMarkets.slice(0,10), totalsMarkets:totalsMarkets.slice(0,10) });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Rendimiento por jugador clave
+app.get('/player-impact', async (req, res) => {
+  const { teamId, fixtureId } = req.query;
+  if (!teamId) return res.status(400).json({ error: 'Se requiere teamId' });
+  try {
+    const s = await getActiveSeason(teamId);
+    const [squadR, recentR] = await Promise.all([
+      af(`/players/squads?team=${teamId}`),
+      af(`/fixtures?team=${teamId}&season=${s}&last=15&status=FT`),
+    ]);
+
+    const squad = squadR.response?.[0]?.players || [];
+    const fixtures = recentR.response || [];
+
+    // Obtener stats de jugadores clave (top por posición)
+    const keyPlayers = squad
+      .filter(p => ['Attacker','Midfielder'].includes(p.position))
+      .slice(0, 8);
+
+    // Analizar partidos con/sin cada jugador clave
+    const playerImpact = {};
+    for (const player of keyPlayers.slice(0,5)) {
+      const pid = player.id;
+      const withPlayer = [], withoutPlayer = [];
+
+      for (const fix of fixtures.slice(0,15)) {
+        const fid = fix.fixture.id;
+        try {
+          const pd = await af(`/fixtures/players?fixture=${fid}&team=${teamId}`);
+          const players = pd.response?.[0]?.players || [];
+          const played = players.find(p=>p.player.id===pid);
+          const isHome = fix.teams.home.id === parseInt(teamId);
+          const goals = isHome?(fix.score.fulltime.home||0):(fix.score.fulltime.away||0);
+          const shots = players.find(p=>p.player.id===pid)?.statistics?.[0]?.shots?.total||0;
+
+          if (played && (played.statistics?.[0]?.games?.minutes||0) >= 45) {
+            withPlayer.push({ goals, shots });
+          } else {
+            withoutPlayer.push({ goals });
+          }
+        } catch(e) {}
+      }
+
+      if (withPlayer.length >= 3) {
+        const avgWith = withPlayer.reduce((s,m)=>s+m.goals,0)/withPlayer.length;
+        const avgWithout = withoutPlayer.length ? withoutPlayer.reduce((s,m)=>s+m.goals,0)/withoutPlayer.length : null;
+        playerImpact[pid] = {
+          id: pid,
+          name: player.name,
+          position: player.position,
+          avgGoalsWith: +avgWith.toFixed(2),
+          avgGoalsWithout: avgWithout !== null ? +avgWithout.toFixed(2) : null,
+          impact: avgWithout !== null ? +(avgWith - avgWithout).toFixed(2) : null,
+          gamesAnalyzed: withPlayer.length,
+          isKeyPlayer: avgWithout !== null && (avgWith - avgWithout) > 0.3,
+        };
+      }
+    }
+
+    // Verificar si jugador clave está en alineación del próximo partido
+    let startingKeyPlayers = [];
+    if (fixtureId) {
+      try {
+        const lu = await af(`/fixtures/lineups?fixture=${fixtureId}&team=${teamId}`);
+        const lineup = lu.response?.[0];
+        if (lineup) {
+          const starters = (lineup.startXI||[]).map(p=>p.player.id);
+          startingKeyPlayers = Object.values(playerImpact)
+            .filter(p=>p.isKeyPlayer && starters.includes(p.id))
+            .map(p=>p.name);
+        }
+      } catch(e) {}
+    }
+
+    res.json({
+      teamId: parseInt(teamId),
+      keyPlayers: Object.values(playerImpact).sort((a,b)=>(b.impact||0)-(a.impact||0)),
+      startingKeyPlayers,
+      hasKeyPlayersStarting: startingKeyPlayers.length > 0,
+    });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 app.listen(PORT, () => console.log(`Proxy corriendo en puerto ${PORT}`));
