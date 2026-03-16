@@ -252,10 +252,21 @@ app.get('/stats/advanced', async (req, res) => {
         });
         (pd?.response?.[0]?.players||[]).forEach(p=>{
           if(p.player.pos==='F'||p.player.pos==='A'){
-            const pid=p.player.id, shots=p.statistics?.[0]?.shots?.total||0, goals=p.statistics?.[0]?.goals?.total||0;
-            if(!fwdMap[pid])fwdMap[pid]={name:p.player.name,shots:0,goals:0,games:0,weight:0};
+            const pid=p.player.id;
+            const ps = p.statistics?.[0] || {};
+            const shots = ps.shots?.total||0;
+            const shotsOnTarget = ps.shots?.on||0;
+            const goals = ps.goals?.total||0;
+            const assists = ps.goals?.assists||0;
+            const saves = ps.goals?.saves||ps.goalkeeper?.saves||0;
+            const keyPasses = ps.passes?.key||0;
+            if(!fwdMap[pid])fwdMap[pid]={name:p.player.name,pos:p.player.pos,shots:0,shotsOnTarget:0,goals:0,assists:0,saves:0,keyPasses:0,games:0,weight:0};
             fwdMap[pid].shots+=shots*recencyWeight;
+            fwdMap[pid].shotsOnTarget+=shotsOnTarget*recencyWeight;
             fwdMap[pid].goals+=goals*recencyWeight;
+            fwdMap[pid].assists+=assists*recencyWeight;
+            fwdMap[pid].saves+=saves*recencyWeight;
+            fwdMap[pid].keyPasses+=keyPasses*recencyWeight;
             fwdMap[pid].games++;
             fwdMap[pid].weight+=recencyWeight;
           }
@@ -280,9 +291,20 @@ app.get('/stats/advanced', async (req, res) => {
     const formGoals = last5.length ? last5.reduce((s,m)=>s+m.goals,0)/last5.length : wavg('goals');
     const formTrend = formGoals > wavg('goals') * 1.1 ? 'subiendo' : formGoals < wavg('goals') * 0.9 ? 'bajando' : 'estable';
 
+    const shortN = n => n.split(' ').length<=2?n:n.split(' ')[0][0]+'. '+n.split(' ').slice(1).join(' ');
     const topForwards=Object.values(fwdMap).filter(f=>f.games>=3)
-      .map(f=>({name:f.name.split(' ').length<=2?f.name:f.name.split(' ')[0][0]+'. '+f.name.split(' ').slice(1).join(' '),shots:f.shots/f.weight,goals:f.goals/f.weight}))
-      .sort((a,b)=>b.shots-a.shots).slice(0,3);
+      .map(f=>({
+        name: shortN(f.name),
+        pos: f.pos,
+        shots: +(f.shots/f.weight).toFixed(2),
+        shotsOnTarget: +(f.shotsOnTarget/f.weight).toFixed(2),
+        goals: +(f.goals/f.weight).toFixed(2),
+        assists: +(f.assists/f.weight).toFixed(2),
+        saves: +(f.saves/f.weight).toFixed(2),
+        keyPasses: +(f.keyPasses/f.weight).toFixed(2),
+        games: f.games,
+      }))
+      .sort((a,b)=>b.shots-a.shots).slice(0,5);
 
     res.json({
       teamId:parseInt(teamId), teamRank:tR, opponentRank:oR, opponentTier:oTier,
