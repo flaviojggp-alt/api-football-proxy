@@ -213,9 +213,9 @@ app.get('/stats/advanced', async (req, res) => {
       return home ? teamIsHome : !teamIsHome;
     }).slice(0,10);
 
-    // Si no hay suficientes como local/visitante, usar todos
-    const fixtures = relevantFixtures.length >= 5 ? relevantFixtures : allFixtures.slice(0,10);
-    const isFiltered = relevantFixtures.length >= 5;
+    // Si no hay suficientes como local/visitante, usar todos (mínimo 3)
+    const fixtures = relevantFixtures.length >= 3 ? relevantFixtures : allFixtures.slice(0,10);
+    const isFiltered = relevantFixtures.length >= 3;
 
     const allStats=[], fwdMap={};
     const now = Date.now();
@@ -283,7 +283,15 @@ app.get('/stats/advanced', async (req, res) => {
       const tw=f.reduce((s,m)=>s+m.recencyWeight,0)||1;
       return f.length?f.reduce((s,m)=>s+m[k]*m.recencyWeight,0)/tw:null;
     };
-    const ctx = k => { const t=byTierW(oTier,k),g=wavg(k); return t!==null?t*0.6+g*0.4:g; };
+    const ctx = k => {
+      const t = byTierW(oTier,k);
+      const g = wavg(k);
+      const result = t!==null ? t*0.6+g*0.4 : g;
+      // Sanity check: if result is suspiciously low for offensive stats, use global
+      if(k==='goals' && result < 0.3 && g > 0.3) return g;
+      if(k==='shots' && result < 2.0 && g > 2.0) return g;
+      return result;
+    };
 
     // Racha de resultados (últimos 5)
     const last5 = allStats.slice(0,5);
@@ -310,6 +318,7 @@ app.get('/stats/advanced', async (req, res) => {
       teamId:parseInt(teamId), teamRank:tR, opponentRank:oR, opponentTier:oTier,
       sampleSize:allStats.length, season:s, isHomeContext:isFiltered?home:null,
       form:{ trend:formTrend, last5Goals:+formGoals.toFixed(2), overall:+wavg('goals').toFixed(2) },
+      dataQuality: allStats.length >= 7 ? 'good' : allStats.length >= 4 ? 'limited' : 'poor',
       global:{goals:+wavg('goals').toFixed(2),corners:+wavg('corners').toFixed(2),cards:+wavg('cards').toFixed(2),shots:+wavg('shots').toFixed(2),saves:+wavg('saves').toFixed(2)},
       contextual:{goals:+ctx('goals').toFixed(2),corners:+ctx('corners').toFixed(2),cards:+ctx('cards').toFixed(2),shots:+ctx('shots').toFixed(2),saves:+ctx('saves').toFixed(2)},
       topForwards,
