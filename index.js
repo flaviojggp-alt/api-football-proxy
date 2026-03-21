@@ -275,6 +275,17 @@ app.get('/stats/advanced', async (req, res) => {
     }
 
     // Promedios ponderados por recencia
+    // Fallback si no hay datos — evitar retornar ceros
+    if(allStats.length === 0) {
+      return res.json({
+        teamId:parseInt(teamId), teamRank:tR, opponentRank:oR, opponentTier:oTier,
+        sampleSize:0, season:s, isHomeContext:null, dataQuality:'poor',
+        form:{ trend:'estable', last5Goals:1.2, overall:1.2 },
+        global:{goals:1.2,corners:5.0,cards:2.0,shots:10.0,saves:3.0},
+        contextual:{goals:1.2,corners:5.0,cards:2.0,shots:10.0,saves:3.0},
+        topForwards:[],
+      });
+    }
     const totalWeight = allStats.reduce((s,m)=>s+m.recencyWeight,0)||1;
     const wavg = k => allStats.reduce((s,m)=>s+m[k]*m.recencyWeight,0)/totalWeight;
 
