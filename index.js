@@ -203,32 +203,65 @@ app.get('/stats/advanced', async (req, res) => {
     const [tR,oR]=await Promise.all([getRank(teamId,tL),getRank(opponentId,oL)]);
     const oTier=!oR?'unknown':oR<=6?'top':oR<=12?'mid':'low';
 
-    // Fetch más partidos para filtrar por local/visitante
-    const fixtData = await af(`/fixtures?team=${teamId}&season=${s}&last=20&status=FT`);
-    const allFixtures = fixtData?.response || [];
+    // ── MULTI-SEASON FETCH ────────────────────────────────────────────────────
+    // Si la temporada actual tiene pocos partidos (inicio de temporada),
+    // complementar con temporadas anteriores para tener muestra suficiente.
+    // Pesos: temporada actual = 1.0, anterior = 0.6, hace 2 = 0.35, hace 3 = 0.20
+    // Esto captura patrones históricos de inicio de temporada del equipo.
+    const MIN_SAMPLE = 8; // umbral para considerar muestra suficiente
+    // 3 temporadas: actual + 2 anteriores
+    // Mas de 3 años pierde relevancia (cambios de plantilla, tecnico, sistema tactico)
+    // Pesos basados en literatura: temporada anterior vale ~60%, hace 2 anos ~30%
+    const seasonWeights = [
+      { season: s,     weight: 1.00 }, // temporada actual: peso completo
+      { season: s - 1, weight: 0.60 }, // temporada anterior: 60%
+      { season: s - 2, weight: 0.30 }, // hace 2 temporadas: 30%
+    ];
+
+    let allFixtures = [];
+    let seasonsUsed = [];
+
+    for (const sw of seasonWeights) {
+      try {
+        const fixtData = await af(`/fixtures?team=${teamId}&season=${sw.season}&last=20&status=FT`);
+        const fixtures = fixtData?.response || [];
+        if (fixtures.length > 0) {
+          // Tag each fixture with its season weight for later ponderacion
+          fixtures.forEach(f => { f._seasonWeight = sw.weight; f._season = sw.season; });
+          allFixtures = allFixtures.concat(fixtures);
+          seasonsUsed.push(sw.season);
+        }
+      } catch(e) {}
+      // Stop fetching more seasons if we already have enough current-season data
+      if (allFixtures.filter(f => f._season === s).length >= MIN_SAMPLE) break;
+    }
 
     // Separar por local/visitante
     const relevantFixtures = allFixtures.filter(f => {
       const teamIsHome = f.teams.home.id === parseInt(teamId);
       return home ? teamIsHome : !teamIsHome;
-    }).slice(0,10);
+    }).slice(0, 15);
 
     // Si no hay suficientes como local/visitante, usar todos (mínimo 3)
-    const fixtures = relevantFixtures.length >= 3 ? relevantFixtures : allFixtures.slice(0,10);
+    const fixtures = relevantFixtures.length >= 3 ? relevantFixtures : allFixtures.slice(0, 15);
     const isFiltered = relevantFixtures.length >= 3;
 
     const allStats=[], fwdMap={};
     const now = Date.now();
 
-    for (const fix of fixtures.slice(0,10)) {
+    for (const fix of fixtures.slice(0,15)) {
       const fid=fix.fixture.id, isHomeMatch=fix.teams.home.id===parseInt(teamId);
       const rivalId=isHomeMatch?fix.teams.away.id:fix.teams.home.id;
       const matchDate = new Date(fix.fixture.date).getTime();
       const daysAgo = (now - matchDate) / (1000*60*60*24);
 
-      // Peso por recencia: partidos recientes pesan más
-      // Últimos 5 partidos: peso 2.0, anteriores: peso 1.0
-      const recencyWeight = daysAgo <= 45 ? 2.0 : daysAgo <= 90 ? 1.5 : 1.0;
+      // Peso combinado: recencia x peso de temporada
+      // Temporada actual reciente: 2.0 x 1.0 = 2.0 (maximo)
+      // Temporada anterior reciente: 2.0 x 0.6 = 1.2
+      // Temporada hace 2 años: 1.0 x 0.35 = 0.35 (informativo)
+      const recencyFactor = daysAgo <= 45 ? 2.0 : daysAgo <= 90 ? 1.5 : 1.0;
+      const seasonFactor = fix._seasonWeight || 1.0;
+      const recencyWeight = recencyFactor * seasonFactor;
 
       let rR=null;
       try { const rl=await getLeague(rivalId); if(rl)rR=await getRank(rivalId,rl); } catch(e){}
@@ -327,7 +360,7 @@ app.get('/stats/advanced', async (req, res) => {
 
     res.json({
       teamId:parseInt(teamId), teamRank:tR, opponentRank:oR, opponentTier:oTier,
-      sampleSize:allStats.length, season:s, isHomeContext:isFiltered?home:null,
+      sampleSize:allStats.length, season:s, seasonsUsed:seasonsUsed, isHomeContext:isFiltered?home:null,
       form:{ trend:formTrend, last5Goals:+formGoals.toFixed(2), overall:+wavg('goals').toFixed(2) },
       dataQuality: allStats.length >= 7 ? 'good' : allStats.length >= 4 ? 'limited' : 'poor',
       global:{goals:+wavg('goals').toFixed(2),corners:+wavg('corners').toFixed(2),cards:+wavg('cards').toFixed(2),shots:+wavg('shots').toFixed(2),saves:+wavg('saves').toFixed(2)},
@@ -377,7 +410,7 @@ app.get('/h2h', async (req, res) => {
   const { home, away, last } = req.query;
   if (!home||!away) return res.status(400).json({ error:'Se requieren home y away' });
   try {
-    const data=await af(`/fixtures/headtohead?h2h=${home}-${away}&last=${last||10}&status=FT`);
+    const data=await af(`/fixtures/headtohead?h2h=${home}-${away}&last=${last||15}&status=FT`);
     const enriched=[];
     for(const fix of(data.response||[]).slice(0,10)){
       try {
