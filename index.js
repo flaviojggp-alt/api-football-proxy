@@ -6,6 +6,35 @@ const app = express();
 const PORT = process.env.PORT || 8080;
 const AF = 'https://v3.football.api-sports.io';
 const ODDS_BASE = 'https://api.the-odds-api.com/v4';
+
+// Mapa de keys internos a keys de The Odds API
+// Algunos nombres no coinciden exactamente con lo que espera the-odds-api.com
+const ODDS_SPORT_MAP = {
+  'soccer_spain_la_liga':     'soccer_spain_la_liga',
+  'soccer_epl':               'soccer_epl',
+  'soccer_uefa_champs_league':'soccer_uefa_champs_league',
+  'soccer_uefa_europa_league':'soccer_uefa_europa_league',
+  'soccer_germany_bundesliga':'soccer_germany_bundesliga',
+  'soccer_italy_serie_a':     'soccer_italy_serie_a',
+  'soccer_france_ligue_one':  'soccer_france_ligue_one',
+  'soccer_netherlands_eredivisie': 'soccer_netherlands_eredivisie',
+  'soccer_portugal_primeira_liga': 'soccer_portugal_primeira_liga',
+  'soccer_brazil_campeonato': 'soccer_brazil_campeonato',
+  'soccer_argentina_primera_division': 'soccer_argentina_primera_division',
+  'soccer_mexico_ligamx':     'soccer_mexico_ligamx',
+  'soccer_world_cup':         'soccer_world_cup',
+  'soccer_copa_america':      'soccer_copa_america',
+  // Default fallback
+  'default': 'soccer_epl'
+};
+
+// Normaliza el sport key para The Odds API
+const normalizeSport = (sport) => {
+  if (!sport) return 'soccer_epl';
+  if (ODDS_SPORT_MAP[sport]) return ODDS_SPORT_MAP[sport];
+  // Si el key existe literalmente en The Odds API, usarlo directo
+  return sport;
+};
 const WEATHER_BASE = 'https://api.open-meteo.com/v1/forecast';
 
 app.use(cors());
@@ -429,7 +458,8 @@ app.get('/odds/match', async (req, res) => {
   const{home,away,sport}=req.query;
   if(!home||!away) return res.status(400).json({error:'Se requieren home y away'});
   try {
-    const r=await fetch(`${ODDS_BASE}/sports/${sport||'soccer_epl'}/odds/?apiKey=${ODDS_KEY}&regions=eu&markets=h2h&oddsFormat=decimal`);
+    const normalizedSport = normalizeSport(sport);
+    const r=await fetch(`${ODDS_BASE}/sports/${normalizedSport}/odds/?apiKey=${ODDS_KEY}&regions=eu&markets=h2h&oddsFormat=decimal`);
     const games=await r.json();
     if(!Array.isArray(games)) return res.json({found:false});
     const hL=home.toLowerCase(),aL=away.toLowerCase();
@@ -777,7 +807,7 @@ app.get('/odds/compare', async (req, res) => {
   if (!home||!away) return res.status(400).json({ error: 'Se requieren home y away' });
   try {
     const markets = market || 'h2h,totals';
-    const r = await fetch(`${ODDS_BASE}/sports/${sport||'soccer_epl'}/odds/?apiKey=${ODDS_KEY}&regions=eu,uk&markets=${markets}&oddsFormat=decimal`);
+    const r = await fetch(`${ODDS_BASE}/sports/${normalizeSport(sport)}/odds/?apiKey=${ODDS_KEY}&regions=eu,uk&markets=${markets}&oddsFormat=decimal`);
     const games = await r.json();
     if (!Array.isArray(games)) return res.json({ found:false });
     const hL=home.toLowerCase(), aL=away.toLowerCase();
@@ -906,8 +936,8 @@ app.get('/odds/movement', async (req, res) => {
   try {
     // The Odds API historical endpoint para odds de apertura
     const [currentR, historicalR] = await Promise.all([
-      fetch(`${ODDS_BASE}/sports/${sport||'soccer_epl'}/odds/?apiKey=${ODDS_KEY}&regions=eu&markets=h2h&oddsFormat=decimal`),
-      fetch(`${ODDS_BASE}/sports/${sport||'soccer_epl'}/odds/?apiKey=${ODDS_KEY}&regions=eu&markets=h2h&oddsFormat=decimal&dateFormat=iso`),
+      fetch(`${ODDS_BASE}/sports/${normalizeSport(sport)}/odds/?apiKey=${ODDS_KEY}&regions=eu&markets=h2h&oddsFormat=decimal`),
+      fetch(`${ODDS_BASE}/sports/${normalizeSport(sport)}/odds/?apiKey=${ODDS_KEY}&regions=eu&markets=h2h&oddsFormat=decimal&dateFormat=iso`),
     ]);
     const current = await currentR.json();
     if (!Array.isArray(current)) return res.json({ found:false });
@@ -974,7 +1004,7 @@ app.get('/odds/asian', async (req, res) => {
   const { home, away, sport } = req.query;
   if (!home||!away) return res.status(400).json({ error: 'Se requieren home y away' });
   try {
-    const r = await fetch(`${ODDS_BASE}/sports/${sport||'soccer_epl'}/odds/?apiKey=${ODDS_KEY}&regions=eu,uk&markets=asian_handicap,totals&oddsFormat=decimal`);
+    const r = await fetch(`${ODDS_BASE}/sports/${normalizeSport(sport)}/odds/?apiKey=${ODDS_KEY}&regions=eu,uk&markets=asian_handicap,totals&oddsFormat=decimal`);
     const games = await r.json();
     if (!Array.isArray(games)) return res.json({ found:false });
     const hL=home.toLowerCase(), aL=away.toLowerCase();
