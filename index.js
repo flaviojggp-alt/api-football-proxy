@@ -1,4 +1,4 @@
-const express = require('express');
+  const express = require('express');
 const cors = require('cors');
 const fetch = require('node-fetch');
 
@@ -1139,6 +1139,70 @@ app.get('/player-impact', async (req, res) => {
       keyPlayers: Object.values(playerImpact).sort((a,b)=>(b.impact||0)-(a.impact||0)),
       startingKeyPlayers,
       hasKeyPlayersStarting: startingKeyPlayers.length > 0,
+    });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+
+// ── GOLEADORES POR EQUIPO EN EL TORNEO ────────────────────────────────────
+app.get('/players/scorers', async (req, res) => {
+  const { teamId, leagueId } = req.query;
+  if (!teamId) return res.status(400).json({ error: 'Se requiere teamId' });
+  try {
+    const season = await getActiveSeason(teamId);
+
+    // Obtener liga activa si no se especifica
+    const lgId = leagueId || await (async () => {
+      try {
+        const r = await af(`/leagues?team=${teamId}&current=true`);
+        return r.response?.[0]?.league?.id || null;
+      } catch(e) { return null; }
+    })();
+
+    if (!lgId) return res.json({ found: false, players: [] });
+
+    const [scorersR, squadR] = await Promise.all([
+      af(`/players/topscorers?league=${lgId}&season=${season}`),
+      af(`/players/squads?team=${teamId}`),
+    ]);
+
+    const squadIds = new Set(
+      (squadR.response?.[0]?.players || []).map(p => p.id)
+    );
+
+    const scorers = (scorersR.response || [])
+      .filter(entry => squadIds.has(entry.player.id))
+      .slice(0, 8)
+      .map(entry => {
+        const stats = entry.statistics?.[0] || {};
+        return {
+          id: entry.player.id,
+          name: entry.player.name,
+          photo: entry.player.photo,
+          goals: stats.goals?.total || 0,
+          assists: stats.goals?.assists || 0,
+          games: stats.games?.appearences || 0,
+          minutesPerGoal: stats.goals?.total > 0
+            ? Math.round((stats.games?.minutes || 0) / stats.goals.total)
+            : null,
+          goalsPerGame: stats.goals?.total > 0 && stats.games?.appearences > 0
+            ? +(stats.goals.total / stats.games.appearences).toFixed(2)
+            : 0,
+          onTarget: stats.shots?.on || 0,
+          shotsPerGame: stats.games?.appearences > 0
+            ? +((stats.shots?.total || 0) / stats.games.appearences).toFixed(1)
+            : 0,
+        };
+      })
+      .filter(p => p.goals > 0 || p.games >= 2)
+      .sort((a, b) => b.goals - a.goals || b.goalsPerGame - a.goalsPerGame);
+
+    res.json({
+      found: scorers.length > 0,
+      leagueId: lgId,
+      season,
+      teamId: parseInt(teamId),
+      players: scorers,
     });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
