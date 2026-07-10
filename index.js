@@ -550,6 +550,7 @@ app.get('/match-importance', async (req, res) => {
       homeRank, awayRank, totalTeams,
       homeRelegation, awayRelegation,
       homeTitleRace, awayTitleRace,
+      homeEuro, awayEuro,
       isLateStage, notes,
     });
   } catch(e) { res.status(500).json({ error: e.message }); }
@@ -721,7 +722,7 @@ app.get('/stats/defensive', async (req, res) => {
     const s = await getActiveSeason(teamId);
     const fixtData = await af(`/fixtures?team=${teamId}&season=${s}&last=10&status=FT`);
     const fixtures = fixtData?.response || [];
-    const defStats = { goalsAgainst:0, shotsAgainst:0, cornersAgainst:0, savesFor:0, n:0 };
+    const defStats = { goalsAgainst:0, shotsAgainst:0, cornersAgainst:0, cardsAgainst:0, savesFor:0, n:0 };
 
     for (const fix of fixtures.slice(0,10)) {
       const fid = fix.fixture.id;
@@ -734,6 +735,7 @@ app.get('/stats/defensive', async (req, res) => {
         defStats.goalsAgainst += isHome?(fix.score.fulltime.away||0):(fix.score.fulltime.home||0);
         defStats.shotsAgainst += getS('Total Shots');
         defStats.cornersAgainst += getS('Corner Kicks');
+        defStats.cardsAgainst += getS('Yellow Cards')+getS('Red Cards');
         defStats.savesFor += getS('Goalkeeper Saves');
         defStats.n++;
       } catch(e) {}
@@ -741,9 +743,11 @@ app.get('/stats/defensive', async (req, res) => {
     const n = defStats.n || 1;
     res.json({
       teamId: parseInt(teamId),
+      sampleSize: defStats.n,
       avgGoalsAgainst: +(defStats.goalsAgainst/n).toFixed(2),
       avgShotsAgainst: +(defStats.shotsAgainst/n).toFixed(2),
       avgCornersAgainst: +(defStats.cornersAgainst/n).toFixed(2),
+      avgCardsAgainst: +(defStats.cardsAgainst/n).toFixed(2),
       avgSavesFor: +(defStats.savesFor/n).toFixed(2),
       defensiveRating: defStats.goalsAgainst/n <= 0.8 ? 'elite' : defStats.goalsAgainst/n <= 1.2 ? 'solida' : defStats.goalsAgainst/n <= 1.8 ? 'media' : 'debil',
     });
