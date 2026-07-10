@@ -221,8 +221,37 @@ app.get('/stats/advanced', async (req, res) => {
   const home = isHome === 'true';
   try {
     const s = await getActiveSeason(teamId);
-    const getLeague = async tid => { try { const d=await af(`/leagues?team=${tid}&season=${s}&type=League`); return d.response?.[0]?.league?.id||null; } catch(e){return null;} };
-    const getRank = async (tid,lid) => { if(!lid)return null; try { const d=await af(`/standings?league=${lid}&season=${s}&team=${tid}`); const st=d.response?.[0]?.league?.standings?.[0]||[]; return st.find(x=>x.team.id===parseInt(tid))?.rank||null; } catch(e){return null;} };
+
+    // ── CACHE POR REQUEST ─────────────────────────────────────────────────────
+    // Antes: getLeague()+getRank() se llamaban de cero por cada rival de cada uno
+    // de los ~15 partidos históricos analizados (hasta ~30 llamadas extra a
+    // API-Football solo para esto). Como muchos rivales se repiten (mismo rival
+    // en varias temporadas, o local/visitante), cachear por equipo y por standings
+    // de liga+temporada evita repetir la misma consulta.
+    const leagueCache = new Map();      // teamId -> leagueId
+    const standingsCache = new Map();   // "leagueId-season" -> standings[]
+
+    const getLeague = async tid => {
+      if (leagueCache.has(tid)) return leagueCache.get(tid);
+      let lid = null;
+      try { const d = await af(`/leagues?team=${tid}&season=${s}&type=League`); lid = d.response?.[0]?.league?.id || null; } catch(e) {}
+      leagueCache.set(tid, lid);
+      return lid;
+    };
+    const getStandings = async lid => {
+      const key = `${lid}-${s}`;
+      if (standingsCache.has(key)) return standingsCache.get(key);
+      let standings = [];
+      try { const d = await af(`/standings?league=${lid}&season=${s}`); standings = d.response?.[0]?.league?.standings?.[0] || []; } catch(e) {}
+      standingsCache.set(key, standings);
+      return standings;
+    };
+    const getRank = async (tid,lid) => {
+      if (!lid) return null;
+      const standings = await getStandings(lid);
+      return standings.find(x=>x.team.id===parseInt(tid))?.rank || null;
+    };
+
     const [tL,oL]=await Promise.all([getLeague(teamId),getLeague(opponentId)]);
     const [tR,oR]=await Promise.all([getRank(teamId,tL),getRank(opponentId,oL)]);
     const oTier=!oR?'unknown':oR<=6?'top':oR<=12?'mid':'low';
