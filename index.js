@@ -1100,28 +1100,39 @@ app.get('/player-impact', async (req, res) => {
       .filter(p => ['Attacker','Midfielder'].includes(p.position))
       .slice(0, 8);
 
+    // FIX: antes el loop era jugador→partido, pidiendo /fixtures/players
+    // 5 veces (una por jugador clave) para el MISMO partido — ese endpoint
+    // ya devuelve TODOS los jugadores del equipo en una sola llamada.
+    // Ahora se invierte a partido→jugador: 1 llamada por partido (15 en vez
+    // de 75), reutilizada localmente para revisar los 5 jugadores clave.
     const playerImpact = {};
+    const withPlayerMap = {}, withoutPlayerMap = {};
+    keyPlayers.slice(0,5).forEach(p => { withPlayerMap[p.id]=[]; withoutPlayerMap[p.id]=[]; });
+
+    for (const fix of fixtures.slice(0,15)) {
+      const fid = fix.fixture.id;
+      try {
+        const pd = await af(`/fixtures/players?fixture=${fid}&team=${teamId}`);
+        const players = pd.response?.[0]?.players || [];
+        const isHome = fix.teams.home.id === parseInt(teamId);
+        const goals = isHome?(fix.score.fulltime.home||0):(fix.score.fulltime.away||0);
+
+        for (const player of keyPlayers.slice(0,5)) {
+          const pid = player.id;
+          const played = players.find(p=>p.player.id===pid);
+          const shots = played?.statistics?.[0]?.shots?.total||0;
+          if (played && (played.statistics?.[0]?.games?.minutes||0) >= 45) {
+            withPlayerMap[pid].push({ goals, shots });
+          } else {
+            withoutPlayerMap[pid].push({ goals });
+          }
+        }
+      } catch(e) {}
+    }
+
     for (const player of keyPlayers.slice(0,5)) {
       const pid = player.id;
-      const withPlayer = [], withoutPlayer = [];
-
-      for (const fix of fixtures.slice(0,15)) {
-        const fid = fix.fixture.id;
-        try {
-          const pd = await af(`/fixtures/players?fixture=${fid}&team=${teamId}`);
-          const players = pd.response?.[0]?.players || [];
-          const played = players.find(p=>p.player.id===pid);
-          const isHome = fix.teams.home.id === parseInt(teamId);
-          const goals = isHome?(fix.score.fulltime.home||0):(fix.score.fulltime.away||0);
-          const shots = players.find(p=>p.player.id===pid)?.statistics?.[0]?.shots?.total||0;
-
-          if (played && (played.statistics?.[0]?.games?.minutes||0) >= 45) {
-            withPlayer.push({ goals, shots });
-          } else {
-            withoutPlayer.push({ goals });
-          }
-        } catch(e) {}
-      }
+      const withPlayer = withPlayerMap[pid], withoutPlayer = withoutPlayerMap[pid];
 
       if (withPlayer.length >= 3) {
         const avgWith = withPlayer.reduce((s,m)=>s+m.goals,0)/withPlayer.length;
