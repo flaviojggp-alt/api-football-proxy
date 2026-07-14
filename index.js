@@ -40,10 +40,62 @@ const WEATHER_BASE = 'https://api.open-meteo.com/v1/forecast';
 app.use(cors());
 app.use(express.json());
 
+// ── CACHE A NIVEL PROXY (5-10 min TTL) ─────────────────────────────────────
+// Todas las llamadas a API-Football pasan por af(), así que cachear aquí
+// cubre automáticamente cualquier combinación de teamId/opponentId/leagueId
+// sin tener que tocar cada endpoint individualmente. Los datos de stats,
+// h2h, xg, lesiones, etc. no cambian minuto a minuto, así que un TTL corto
+// reduce drásticamente las llamadas repetidas cuando el usuario analiza el
+// mismo partido varias veces o varios partidos comparten equipos.
+const _afCache = new Map(); // path completo (con querystring) -> { data, ts }
+const AF_CACHE_TTL_MS = 8 * 60 * 1000; // 8 minutos
+
+// Limpieza periódica para que el Map no crezca sin límite en procesos de larga duración
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of _afCache) {
+    if (now - entry.ts > AF_CACHE_TTL_MS) _afCache.delete(key);
+  }
+}, 5 * 60 * 1000).unref();
+
+// ── MONITOREO DE RATE LIMIT ─────────────────────────────────────────────────
+// API-Football devuelve estos headers en cada respuesta. Los guardamos para
+// poder exponerlos en '/' y para loguear una advertencia cuando queda poco
+// margen (evita enterarnos del límite solo cuando ya empiezan a fallar los
+// requests).
+const rateLimitStatus = {
+  dailyRemaining: null,
+  dailyLimit: null,
+  minuteRemaining: null,
+  minuteLimit: null,
+  lastChecked: null,
+};
+const RATE_LIMIT_WARN_THRESHOLD = 200; // avisar cuando quedan <=200 requests del día
+
 async function af(path) {
+  const cached = _afCache.get(path);
+  if (cached && (Date.now() - cached.ts) < AF_CACHE_TTL_MS) {
+    return cached.data;
+  }
+
   const KEY = process.env.API_FOOTBALL_KEY;
   const r = await fetch(`${AF}${path}`, { headers: { 'x-apisports-key': KEY, 'Accept': 'application/json' } });
-  return r.json();
+
+  // Headers de rate limit (nombres pueden variar mayúsc/minúsc según el runtime)
+  const dailyRemaining = r.headers.get('x-ratelimit-requests-remaining');
+  const dailyLimit = r.headers.get('x-ratelimit-requests-limit');
+  if (dailyRemaining !== null) {
+    rateLimitStatus.dailyRemaining = parseInt(dailyRemaining, 10);
+    rateLimitStatus.dailyLimit = dailyLimit ? parseInt(dailyLimit, 10) : rateLimitStatus.dailyLimit;
+    rateLimitStatus.lastChecked = new Date().toISOString();
+    if (rateLimitStatus.dailyRemaining <= RATE_LIMIT_WARN_THRESHOLD) {
+      console.warn(`⚠️  API-Football: quedan solo ${rateLimitStatus.dailyRemaining} requests hoy (límite diario ${rateLimitStatus.dailyLimit})`);
+    }
+  }
+
+  const data = await r.json();
+  _afCache.set(path, { data, ts: Date.now() });
+  return data;
 }
 
 async function getActiveSeason(teamId) {
@@ -57,7 +109,13 @@ async function getActiveSeason(teamId) {
   return y - 1;
 }
 
-app.get('/', (req, res) => res.json({ status:'ok', football_key:!!process.env.API_FOOTBALL_KEY, odds_key:!!process.env.ODDS_API_KEY }));
+app.get('/', (req, res) => res.json({
+  status:'ok',
+  football_key:!!process.env.API_FOOTBALL_KEY,
+  odds_key:!!process.env.ODDS_API_KEY,
+  rateLimit: rateLimitStatus,
+  cacheSize: _afCache.size,
+}));
 
 // Proxy genérico
 app.get('/api/*', async (req, res) => {
@@ -112,7 +170,6 @@ app.get('/referee', async (req, res) => {
   if (!name) return res.status(400).json({ error:'Se requiere name' });
   try {
     const s = season || new Date().getFullYear();
-    // Buscar fixtures del árbitro en la temporada actual
     const d = await af(`/fixtures?referee=${encodeURIComponent(name)}&season=${s}&last=20&status=FT`);
     const fixtures = d.response || [];
     if (!fixtures.length) return res.json({ found:false, name });
@@ -128,7 +185,6 @@ app.get('/referee', async (req, res) => {
       n++;
     });
 
-    // Obtener tarjetas reales desde statistics de cada partido
     let cardStats = { yellow:0, red:0, total:0, matches:0 };
     for (const fix of fixtures.slice(0,10)) {
       try {
@@ -165,7 +221,6 @@ app.get('/weather', async (req, res) => {
     const url = `${WEATHER_BASE}?latitude=${lat}&longitude=${lon}&hourly=temperature_2m,precipitation_probability,weathercode&timezone=auto&forecast_days=7`;
     const r = await fetch(url);
     const data = await r.json();
-    // Find the hour closest to match date
     const matchDate = date ? new Date(date) : new Date();
     const times = data.hourly?.time || [];
     let closestIdx = 0, minDiff = Infinity;
@@ -176,16 +231,15 @@ app.get('/weather', async (req, res) => {
     const temp = data.hourly?.temperature_2m?.[closestIdx];
     const precipProb = data.hourly?.precipitation_probability?.[closestIdx];
     const wcode = data.hourly?.weathercode?.[closestIdx];
-    // Weather impact on match
     const isRainy = precipProb > 50 || (wcode >= 51 && wcode <= 99);
     const isCold = temp < 5;
     const impact = {
       temp: temp ? `${temp.toFixed(0)}°C` : null,
       precipProb: precipProb ? `${precipProb}%` : null,
       condition: isRainy ? 'lluvia' : isCold ? 'frío' : 'normal',
-      goalsAdj: isRainy ? -0.3 : 0,        // lluvia reduce goles
-      cornersAdj: isRainy ? -0.8 : 0,       // lluvia reduce córners
-      cardsAdj: isRainy ? 0.3 : 0,          // lluvia puede aumentar tarjetas
+      goalsAdj: isRainy ? -0.3 : 0,
+      cornersAdj: isRainy ? -0.8 : 0,
+      cardsAdj: isRainy ? 0.3 : 0,
     };
     res.json({ found:true, ...impact });
   } catch(e) { res.json({ found:false, error:e.message }); }
@@ -214,7 +268,6 @@ app.get('/venue-coords', async (req, res) => {
   for (const [k,v] of Object.entries(COORDS)) {
     if (key.includes(k)) return res.json({ found:true, ...v, city:k });
   }
-  // Default to Madrid if not found
   res.json({ found:false, lat:40.4168, lon:-3.7038 });
 });
 
@@ -226,25 +279,46 @@ app.get('/stats/advanced', async (req, res) => {
   const home = isHome === 'true';
   try {
     const s = await getActiveSeason(teamId);
-    const getLeague = async tid => { try { const d=await af(`/leagues?team=${tid}&season=${s}&type=League`); return d.response?.[0]?.league?.id||null; } catch(e){return null;} };
-    const getRank = async (tid,lid) => { if(!lid)return null; try { const d=await af(`/standings?league=${lid}&season=${s}&team=${tid}`); const st=d.response?.[0]?.league?.standings?.[0]||[]; return st.find(x=>x.team.id===parseInt(tid))?.rank||null; } catch(e){return null;} };
+
+    // ── CACHE POR REQUEST ─────────────────────────────────────────────────────
+    // Antes: getLeague()+getRank() se llamaban de cero por cada rival de cada uno
+    // de los ~15 partidos históricos analizados (hasta ~30 llamadas extra a
+    // API-Football solo para esto). Como muchos rivales se repiten (mismo rival
+    // en varias temporadas, o local/visitante), cachear por equipo y por standings
+    // de liga+temporada evita repetir la misma consulta.
+    const leagueCache = new Map();      // teamId -> leagueId
+    const standingsCache = new Map();   // "leagueId-season" -> standings[]
+
+    const getLeague = async tid => {
+      if (leagueCache.has(tid)) return leagueCache.get(tid);
+      let lid = null;
+      try { const d = await af(`/leagues?team=${tid}&season=${s}&type=League`); lid = d.response?.[0]?.league?.id || null; } catch(e) {}
+      leagueCache.set(tid, lid);
+      return lid;
+    };
+    const getStandings = async lid => {
+      const key = `${lid}-${s}`;
+      if (standingsCache.has(key)) return standingsCache.get(key);
+      let standings = [];
+      try { const d = await af(`/standings?league=${lid}&season=${s}`); standings = d.response?.[0]?.league?.standings?.[0] || []; } catch(e) {}
+      standingsCache.set(key, standings);
+      return standings;
+    };
+    const getRank = async (tid,lid) => {
+      if (!lid) return null;
+      const standings = await getStandings(lid);
+      return standings.find(x=>x.team.id===parseInt(tid))?.rank || null;
+    };
+
     const [tL,oL]=await Promise.all([getLeague(teamId),getLeague(opponentId)]);
     const [tR,oR]=await Promise.all([getRank(teamId,tL),getRank(opponentId,oL)]);
     const oTier=!oR?'unknown':oR<=6?'top':oR<=12?'mid':'low';
 
-    // ── MULTI-SEASON FETCH ────────────────────────────────────────────────────
-    // Si la temporada actual tiene pocos partidos (inicio de temporada),
-    // complementar con temporadas anteriores para tener muestra suficiente.
-    // Pesos: temporada actual = 1.0, anterior = 0.6, hace 2 = 0.35, hace 3 = 0.20
-    // Esto captura patrones históricos de inicio de temporada del equipo.
-    const MIN_SAMPLE = 8; // umbral para considerar muestra suficiente
-    // 3 temporadas: actual + 2 anteriores
-    // Mas de 3 años pierde relevancia (cambios de plantilla, tecnico, sistema tactico)
-    // Pesos basados en literatura: temporada anterior vale ~60%, hace 2 anos ~30%
+    const MIN_SAMPLE = 8;
     const seasonWeights = [
-      { season: s,     weight: 1.00 }, // temporada actual: peso completo
-      { season: s - 1, weight: 0.60 }, // temporada anterior: 60%
-      { season: s - 2, weight: 0.30 }, // hace 2 temporadas: 30%
+      { season: s,     weight: 1.00 },
+      { season: s - 1, weight: 0.60 },
+      { season: s - 2, weight: 0.30 },
     ];
 
     let allFixtures = [];
@@ -255,23 +329,19 @@ app.get('/stats/advanced', async (req, res) => {
         const fixtData = await af(`/fixtures?team=${teamId}&season=${sw.season}&last=20&status=FT`);
         const fixtures = fixtData?.response || [];
         if (fixtures.length > 0) {
-          // Tag each fixture with its season weight for later ponderacion
           fixtures.forEach(f => { f._seasonWeight = sw.weight; f._season = sw.season; });
           allFixtures = allFixtures.concat(fixtures);
           seasonsUsed.push(sw.season);
         }
       } catch(e) {}
-      // Stop fetching more seasons if we already have enough current-season data
       if (allFixtures.filter(f => f._season === s).length >= MIN_SAMPLE) break;
     }
 
-    // Separar por local/visitante
     const relevantFixtures = allFixtures.filter(f => {
       const teamIsHome = f.teams.home.id === parseInt(teamId);
       return home ? teamIsHome : !teamIsHome;
     }).slice(0, 15);
 
-    // Si no hay suficientes como local/visitante, usar todos (mínimo 3)
     const fixtures = relevantFixtures.length >= 3 ? relevantFixtures : allFixtures.slice(0, 15);
     const isFiltered = relevantFixtures.length >= 3;
 
@@ -284,10 +354,6 @@ app.get('/stats/advanced', async (req, res) => {
       const matchDate = new Date(fix.fixture.date).getTime();
       const daysAgo = (now - matchDate) / (1000*60*60*24);
 
-      // Peso combinado: recencia x peso de temporada
-      // Temporada actual reciente: 2.0 x 1.0 = 2.0 (maximo)
-      // Temporada anterior reciente: 2.0 x 0.6 = 1.2
-      // Temporada hace 2 años: 1.0 x 0.35 = 0.35 (informativo)
       const recencyFactor = daysAgo <= 45 ? 2.0 : daysAgo <= 90 ? 1.5 : 1.0;
       const seasonFactor = fix._seasonWeight || 1.0;
       const recencyWeight = recencyFactor * seasonFactor;
@@ -336,8 +402,6 @@ app.get('/stats/advanced', async (req, res) => {
       } catch(e){}
     }
 
-    // Promedios ponderados por recencia
-    // Fallback si no hay datos — evitar retornar ceros
     if(allStats.length === 0) {
       return res.json({
         teamId:parseInt(teamId), teamRank:tR, opponentRank:oR, opponentTier:oTier,
@@ -360,15 +424,13 @@ app.get('/stats/advanced', async (req, res) => {
       const t = byTierW(oTier,k);
       const g = wavg(k);
       const result = t!==null ? t*0.6+g*0.4 : g;
-      // Sanity check: if result is suspiciously low for offensive stats, use global
       if(k==='goals' && result < 0.3 && g > 0.3) return g;
       if(k==='shots' && result < 2.0 && g > 2.0) return g;
       return result;
     };
 
-    // Racha de resultados (últimos 5)
     const last5 = allStats.slice(0,5);
-    const wins = last5.filter(m=>m.goals > 0).length; // simplificado
+    const wins = last5.filter(m=>m.goals > 0).length;
     const formGoals = last5.length ? last5.reduce((s,m)=>s+m.goals,0)/last5.length : wavg('goals');
     const formTrend = formGoals > wavg('goals') * 1.1 ? 'subiendo' : formGoals < wavg('goals') * 0.9 ? 'bajando' : 'estable';
 
@@ -493,10 +555,9 @@ app.get('/match-importance', async (req, res) => {
       } catch(e) {}
     }
 
-    // Detectar importancia
-    const relegationZone = Math.floor(totalTeams * 0.85); // último 15%
-    const titleRace = 3; // top 3
-    const euroZone = 6;  // top 6
+    const relegationZone = Math.floor(totalTeams * 0.85);
+    const titleRace = 3;
+    const euroZone = 6;
 
     const homeRelegation = homeRank && homeRank >= relegationZone;
     const awayRelegation = awayRank && awayRank >= relegationZone;
@@ -505,14 +566,12 @@ app.get('/match-importance', async (req, res) => {
     const homeEuro = homeRank && homeRank <= euroZone;
     const awayEuro = awayRank && awayRank <= euroZone;
 
-    // Detectar si es jornada final (round contiene números altos)
     const roundNum = round ? parseInt(round.replace(/\D/g,'')) : null;
     const isLateStage = roundNum && roundNum >= (totalTeams - 2) * 2 - 6;
-    const isDerby = false; // podría detectarse por ciudad en futuras versiones
+    const isDerby = false;
 
-    // Calcular nivel de importancia
     let importance = 'normal';
-    let intensityBoost = 0; // boost para tarjetas
+    let intensityBoost = 0;
     let goalsBoost = 0;
     let notes = [];
 
@@ -549,6 +608,7 @@ app.get('/match-importance', async (req, res) => {
       homeRank, awayRank, totalTeams,
       homeRelegation, awayRelegation,
       homeTitleRace, awayTitleRace,
+      homeEuro, awayEuro,
       isLateStage, notes,
     });
   } catch(e) { res.status(500).json({ error: e.message }); }
@@ -614,7 +674,6 @@ app.get('/schedule-fatigue', async (req, res) => {
     const s = await getActiveSeason(teamId);
     const targetDate = matchDate ? new Date(matchDate) : new Date();
 
-    // Partidos de los próximos 10 días y últimos 5 días
     const [nextFixtures, prevFixtures] = await Promise.all([
       af(`/fixtures?team=${teamId}&next=5`),
       af(`/fixtures?team=${teamId}&last=5&status=FT`),
@@ -623,7 +682,6 @@ app.get('/schedule-fatigue', async (req, res) => {
     const upcomingAll = nextFixtures?.response || [];
     const recentAll = prevFixtures?.response || [];
 
-    // Competiciones de alta importancia
     const HIGH_COMP = [
       'UEFA Champions League', 'UEFA Europa League', 'UEFA Conference League',
       'Copa del Rey', 'FA Cup', 'DFB Pokal', 'Coppa Italia', 'Coupe de France',
@@ -632,7 +690,6 @@ app.get('/schedule-fatigue', async (req, res) => {
     ];
     const isHighComp = name => HIGH_COMP.some(c => (name||'').includes(c));
 
-    // Buscar partidos importantes en los próximos 7 días
     const importantUpcoming = upcomingAll.filter(f => {
       const fDate = new Date(f.fixture.date);
       const daysAway = (fDate - targetDate) / (1000*60*60*24);
@@ -647,7 +704,6 @@ app.get('/schedule-fatigue', async (req, res) => {
       isHome: f.teams.home.id === parseInt(teamId),
     }));
 
-    // Buscar partidos jugados en los últimos 4 días (fatiga)
     const recentHighComp = recentAll.filter(f => {
       const fDate = new Date(f.fixture.date);
       const daysAgo = (targetDate - fDate) / (1000*60*60*24);
@@ -659,12 +715,10 @@ app.get('/schedule-fatigue', async (req, res) => {
       opponent: f.teams.home.id === parseInt(teamId) ? f.teams.away.name : f.teams.home.name,
     }));
 
-    // Calcular nivel de rotación esperada
     let rotationLevel = 'none';
     let goalsAdj = 0, shotsAdj = 0, cornersAdj = 0, cardsAdj = 0, confidenceAdj = 0;
     let notes = [];
 
-    // Fatiga por partido reciente (jugó hace 3-4 días)
     if (recentHighComp.length > 0) {
       const recent = recentHighComp[0];
       rotationLevel = 'fatigue';
@@ -676,7 +730,6 @@ app.get('/schedule-fatigue', async (req, res) => {
       notes.push(`Jugó ${recent.league} hace ${recent.daysAgo} día(s) vs ${recent.opponent}`);
     }
 
-    // Rotación por partido importante próximo
     if (importantUpcoming.length > 0) {
       const next = importantUpcoming[0];
       const isKnockout = (next.round||'').toLowerCase().includes('final') ||
@@ -727,7 +780,7 @@ app.get('/stats/defensive', async (req, res) => {
     const s = await getActiveSeason(teamId);
     const fixtData = await af(`/fixtures?team=${teamId}&season=${s}&last=10&status=FT`);
     const fixtures = fixtData?.response || [];
-    const defStats = { goalsAgainst:0, shotsAgainst:0, cornersAgainst:0, savesFor:0, n:0 };
+    const defStats = { goalsAgainst:0, shotsAgainst:0, cornersAgainst:0, cardsAgainst:0, savesFor:0, n:0 };
 
     for (const fix of fixtures.slice(0,10)) {
       const fid = fix.fixture.id;
@@ -740,6 +793,7 @@ app.get('/stats/defensive', async (req, res) => {
         defStats.goalsAgainst += isHome?(fix.score.fulltime.away||0):(fix.score.fulltime.home||0);
         defStats.shotsAgainst += getS('Total Shots');
         defStats.cornersAgainst += getS('Corner Kicks');
+        defStats.cardsAgainst += getS('Yellow Cards')+getS('Red Cards');
         defStats.savesFor += getS('Goalkeeper Saves');
         defStats.n++;
       } catch(e) {}
@@ -747,9 +801,11 @@ app.get('/stats/defensive', async (req, res) => {
     const n = defStats.n || 1;
     res.json({
       teamId: parseInt(teamId),
+      sampleSize: defStats.n,
       avgGoalsAgainst: +(defStats.goalsAgainst/n).toFixed(2),
       avgShotsAgainst: +(defStats.shotsAgainst/n).toFixed(2),
       avgCornersAgainst: +(defStats.cornersAgainst/n).toFixed(2),
+      avgCardsAgainst: +(defStats.cardsAgainst/n).toFixed(2),
       avgSavesFor: +(defStats.savesFor/n).toFixed(2),
       defensiveRating: defStats.goalsAgainst/n <= 0.8 ? 'elite' : defStats.goalsAgainst/n <= 1.2 ? 'solida' : defStats.goalsAgainst/n <= 1.8 ? 'media' : 'debil',
     });
@@ -772,12 +828,10 @@ app.get('/xg', async (req, res) => {
       try {
         const sd = await af(`/fixtures/statistics?fixture=${fid}&team=${teamId}`);
         const sr = sd?.response?.[0]?.statistics || [];
-        // API-Football incluye xG en algunos partidos
         const xg = parseFloat(sr.find(s=>s.type==='expected_goals'||s.type==='xG')?.value) || null;
         const shots = parseFloat(sr.find(s=>s.type==='Total Shots')?.value)||0;
         const shotsOnTarget = parseFloat(sr.find(s=>s.type==='Shots on Goal')?.value)||0;
         const goals = isHome?(fix.score.fulltime.home||0):(fix.score.fulltime.away||0);
-        // Si no hay xG nativo, estimarlo: xG ≈ shots_on_target * 0.33 + (shots-shots_on_target)*0.05
         const estimatedXG = xg !== null ? xg : shotsOnTarget*0.33 + (shots-shotsOnTarget)*0.05;
         totalXG += estimatedXG;
         totalGoals += goals;
@@ -787,7 +841,7 @@ app.get('/xg', async (req, res) => {
     const nm = n||1;
     const avgXG = totalXG/nm;
     const avgGoals = totalGoals/nm;
-    const xgOverPerformance = avgGoals - avgXG; // positivo = suerte, negativo = mala suerte
+    const xgOverPerformance = avgGoals - avgXG;
     res.json({
       teamId: parseInt(teamId),
       avgXG: +avgXG.toFixed(2),
@@ -817,7 +871,6 @@ app.get('/odds/compare', async (req, res) => {
     });
     if (!match) return res.json({ found:false });
 
-    // Agrupar por mercado y bookmaker
     const comparison = {};
     match.bookmakers.forEach(bm => {
       bm.markets.forEach(mkt => {
@@ -828,7 +881,6 @@ app.get('/odds/compare', async (req, res) => {
       });
     });
 
-    // Encontrar mejor cuota por resultado
     const bestOdds = {};
     Object.values(comparison).forEach(mkt => {
       mkt.bookmakers.forEach(bm => {
@@ -854,12 +906,9 @@ app.get('/poisson', async (req, res) => {
     const hL = parseFloat(homeLambda);
     const aL = parseFloat(awayLambda);
 
-    // Factorial helper
     const fact = n => { let r=1; for(let i=2;i<=n;i++) r*=i; return r; };
-    // Poisson PMF: P(X=k) = e^-λ * λ^k / k!
     const poisson = (lambda, k) => Math.exp(-lambda) * Math.pow(lambda,k) / fact(k);
 
-    // Calcular matriz de probabilidades hasta 6 goles por equipo
     const maxGoals = 7;
     let homeWin=0, draw=0, awayWin=0;
     let over05=0, over15=0, over25=0, over35=0;
@@ -891,7 +940,6 @@ app.get('/poisson', async (req, res) => {
       }
     }
 
-    // Fair odds = 1/probability
     const fairOdds = p => p>0 ? +(1/p).toFixed(2) : null;
 
     res.json({
@@ -927,72 +975,110 @@ app.get('/poisson', async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// Movimiento de cuotas — apertura vs cierre
+// Movimiento de cuotas — apertura real (historical odds) vs cierre/actual
+// NOTA DE COSTO: el endpoint /historical/ de The Odds API consume más créditos
+// por request que el endpoint en vivo. Úsalo solo cuando vayas a analizar/apostar
+// ese partido puntual, no en cada refresh de la pestaña "Hoy".
 app.get('/odds/movement', async (req, res) => {
   const ODDS_KEY = process.env.ODDS_API_KEY;
   if (!ODDS_KEY) return res.status(500).json({ error: 'ODDS_API_KEY no configurada' });
-  const { home, away, sport } = req.query;
+  const { home, away, sport, openHoursBefore } = req.query;
   if (!home||!away) return res.status(400).json({ error: 'Se requieren home y away' });
   try {
-    // The Odds API historical endpoint para odds de apertura
-    const [currentR, historicalR] = await Promise.all([
-      fetch(`${ODDS_BASE}/sports/${normalizeSport(sport)}/odds/?apiKey=${ODDS_KEY}&regions=eu&markets=h2h&oddsFormat=decimal`),
-      fetch(`${ODDS_BASE}/sports/${normalizeSport(sport)}/odds/?apiKey=${ODDS_KEY}&regions=eu&markets=h2h&oddsFormat=decimal&dateFormat=iso`),
-    ]);
-    const current = await currentR.json();
-    if (!Array.isArray(current)) return res.json({ found:false });
-
+    const sportKey = normalizeSport(sport);
     const hL=home.toLowerCase(), aL=away.toLowerCase();
-    const match = current.find(g=>{
+    const findMatch = (games) => (games||[]).find(g=>{
       const ht=g.home_team.toLowerCase(), at=g.away_team.toLowerCase();
       return (ht.includes(hL)||hL.includes(ht.split(' ')[0]))&&(at.includes(aL)||aL.includes(at.split(' ')[0]));
     });
-    if (!match) return res.json({ found:false });
 
-    // Extraer cuotas actuales y detectar movimiento
-    const movements = [];
-    match.bookmakers.forEach(bm => {
-      const h2h = bm.markets.find(m=>m.key==='h2h');
-      if (!h2h) return;
-      const lastUpdate = new Date(h2h.last_update);
-      const homeOdds = h2h.outcomes.find(o=>o.name===match.home_team);
-      const awayOdds = h2h.outcomes.find(o=>o.name===match.away_team);
-      const drawOdds = h2h.outcomes.find(o=>o.name==='Draw');
-      if (homeOdds) {
-        movements.push({
-          bookmaker: bm.title,
-          lastUpdate: h2h.last_update,
-          home: homeOdds.price,
-          draw: drawOdds?.price||null,
-          away: awayOdds?.price||null,
-        });
-      }
-    });
+    // 1. Cuotas actuales — ubican el partido y su commence_time; sirven como "cierre"
+    const currentR = await fetch(`${ODDS_BASE}/sports/${sportKey}/odds/?apiKey=${ODDS_KEY}&regions=eu&markets=h2h&oddsFormat=decimal`);
+    const current = await currentR.json();
+    if (!Array.isArray(current)) return res.json({ found:false });
+    const matchNow = findMatch(current);
+    if (!matchNow) return res.json({ found:false });
 
-    // Detectar consenso del mercado
-    const avgHome = movements.reduce((s,m)=>s+m.home,0)/movements.length;
-    const avgAway = movements.reduce((s,m)=>s+(m.away||0),0)/movements.length;
-    const avgDraw = movements.reduce((s,m)=>s+(m.draw||0),0)/movements.length;
-    const impliedHome = 1/avgHome;
-    const impliedAway = 1/avgAway;
-    const impliedDraw = 1/avgDraw;
-    const totalImplied = impliedHome+impliedAway+impliedDraw;
+    const commenceTime = new Date(matchNow.commence_time);
+    const now = new Date();
+    const hoursUntilKickoff = (commenceTime - now) / (1000*60*60);
+
+    // 2. Snapshot de apertura — X horas antes del kickoff (default 48h)
+    const openWindow = parseFloat(openHoursBefore) || 48;
+    let openingDate = new Date(commenceTime.getTime() - openWindow*60*60*1000);
+    if (openingDate > now) openingDate = new Date(now.getTime() - 5*60*1000); // no se puede pedir fecha futura
+
+    const histR = await fetch(`${ODDS_BASE}/historical/sports/${sportKey}/odds/?apiKey=${ODDS_KEY}&regions=eu&markets=h2h&oddsFormat=decimal&date=${openingDate.toISOString()}`);
+    const histJson = await histR.json();
+    const matchOpen = findMatch(histJson?.data);
+
+    // Promedio de cuotas h2h para un snapshot dado
+    const avgH2H = (game) => {
+      if (!game) return null;
+      const rows = [];
+      game.bookmakers.forEach(bm => {
+        const h2h = bm.markets.find(m=>m.key==='h2h');
+        if (!h2h) return;
+        const ho = h2h.outcomes.find(o=>o.name===game.home_team)?.price;
+        const ao = h2h.outcomes.find(o=>o.name===game.away_team)?.price;
+        const dr = h2h.outcomes.find(o=>o.name==='Draw')?.price;
+        if (ho && ao) rows.push({ home: ho, away: ao, draw: dr||null });
+      });
+      if (!rows.length) return null;
+      const drawRows = rows.filter(r=>r.draw);
+      return {
+        home: +(rows.reduce((s,r)=>s+r.home,0)/rows.length).toFixed(2),
+        away: +(rows.reduce((s,r)=>s+r.away,0)/rows.length).toFixed(2),
+        draw: drawRows.length ? +(drawRows.reduce((s,r)=>s+r.draw,0)/drawRows.length).toFixed(2) : null,
+        bookmakerCount: rows.length,
+      };
+    };
+
+    const opening = avgH2H(matchOpen);
+    const closing = avgH2H(matchNow);
+
+    if (!opening || !closing) {
+      return res.json({
+        found: true, home_team: matchNow.home_team, away_team: matchNow.away_team,
+        commence_time: matchNow.commence_time, movement: null,
+        note: 'No hay snapshot de apertura disponible para esta ventana de horas',
+      });
+    }
+
+    // Probabilidades implícitas normalizadas (sin margen de casa)
+    const impliedProbs = (odds) => {
+      const invH = 1/odds.home, invA = 1/odds.away, invD = odds.draw ? 1/odds.draw : 0;
+      const total = invH+invA+invD;
+      return { home:+(invH/total).toFixed(4), away:+(invA/total).toFixed(4), draw: odds.draw ? +(invD/total).toFixed(4) : null };
+    };
+    const probOpen = impliedProbs(opening);
+    const probClose = impliedProbs(closing);
+
+    const deltaHome = +(probClose.home - probOpen.home).toFixed(4);
+    const deltaAway = +(probClose.away - probOpen.away).toFixed(4);
+    const deltaDraw = (probOpen.draw!==null && probClose.draw!==null) ? +(probClose.draw - probOpen.draw).toFixed(4) : null;
+
+    // Umbral de movimiento significativo: 3 puntos de probabilidad implícita
+    const THRESHOLD = 0.03;
+    let steamSide = null;
+    if (deltaHome >= THRESHOLD) steamSide = 'home';
+    else if (deltaAway >= THRESHOLD) steamSide = 'away';
 
     res.json({
       found: true,
-      home_team: match.home_team,
-      away_team: match.away_team,
-      marketConsensus: {
-        homeWinProb: +(impliedHome/totalImplied).toFixed(4),
-        drawProb: +(impliedDraw/totalImplied).toFixed(4),
-        awayWinProb: +(impliedAway/totalImplied).toFixed(4),
-        avgHomeOdds: +avgHome.toFixed(2),
-        avgDrawOdds: +avgDraw.toFixed(2),
-        avgAwayOdds: +avgAway.toFixed(2),
-        bookmakerCount: movements.length,
-        favorite: impliedHome>impliedAway ? match.home_team : match.away_team,
+      home_team: matchNow.home_team,
+      away_team: matchNow.away_team,
+      commence_time: matchNow.commence_time,
+      hoursUntilKickoff: +hoursUntilKickoff.toFixed(1),
+      opening: { odds: opening, impliedProb: probOpen, snapshotDate: openingDate.toISOString() },
+      closing: { odds: closing, impliedProb: probClose, snapshotDate: now.toISOString() },
+      movement: {
+        deltaHomeProb: deltaHome,
+        deltaAwayProb: deltaAway,
+        deltaDrawProb: deltaDraw,
+        steamSide,
+        isSignificant: Math.abs(deltaHome) >= THRESHOLD || Math.abs(deltaAway) >= THRESHOLD,
       },
-      bookmakers: movements,
     });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -1030,7 +1116,6 @@ app.get('/odds/asian', async (req, res) => {
       });
     });
 
-    // Detectar línea asiática más ofrecida (consenso)
     const ahPoints = {};
     ahMarkets.forEach(m => {
       const key = `${m.point}`;
@@ -1041,7 +1126,6 @@ app.get('/odds/asian', async (req, res) => {
     Object.values(ahPoints).forEach(p => { p.avgPrice = +(p.prices.reduce((s,v)=>s+v,0)/p.prices.length).toFixed(2); });
     const consensusAH = Object.values(ahPoints).sort((a,b)=>b.count-a.count).slice(0,3);
 
-    // Totals consensus
     const totalsPoints = {};
     totalsMarkets.forEach(m => {
       const key = `${m.point}`;
@@ -1074,34 +1158,43 @@ app.get('/player-impact', async (req, res) => {
     const squad = squadR.response?.[0]?.players || [];
     const fixtures = recentR.response || [];
 
-    // Obtener stats de jugadores clave (top por posición)
     const keyPlayers = squad
       .filter(p => ['Attacker','Midfielder'].includes(p.position))
       .slice(0, 8);
 
-    // Analizar partidos con/sin cada jugador clave
+    // FIX: antes el loop era jugador→partido, pidiendo /fixtures/players
+    // 5 veces (una por jugador clave) para el MISMO partido — ese endpoint
+    // ya devuelve TODOS los jugadores del equipo en una sola llamada.
+    // Ahora se invierte a partido→jugador: 1 llamada por partido (15 en vez
+    // de 75), reutilizada localmente para revisar los 5 jugadores clave.
     const playerImpact = {};
+    const withPlayerMap = {}, withoutPlayerMap = {};
+    keyPlayers.slice(0,5).forEach(p => { withPlayerMap[p.id]=[]; withoutPlayerMap[p.id]=[]; });
+
+    for (const fix of fixtures.slice(0,15)) {
+      const fid = fix.fixture.id;
+      try {
+        const pd = await af(`/fixtures/players?fixture=${fid}&team=${teamId}`);
+        const players = pd.response?.[0]?.players || [];
+        const isHome = fix.teams.home.id === parseInt(teamId);
+        const goals = isHome?(fix.score.fulltime.home||0):(fix.score.fulltime.away||0);
+
+        for (const player of keyPlayers.slice(0,5)) {
+          const pid = player.id;
+          const played = players.find(p=>p.player.id===pid);
+          const shots = played?.statistics?.[0]?.shots?.total||0;
+          if (played && (played.statistics?.[0]?.games?.minutes||0) >= 45) {
+            withPlayerMap[pid].push({ goals, shots });
+          } else {
+            withoutPlayerMap[pid].push({ goals });
+          }
+        }
+      } catch(e) {}
+    }
+
     for (const player of keyPlayers.slice(0,5)) {
       const pid = player.id;
-      const withPlayer = [], withoutPlayer = [];
-
-      for (const fix of fixtures.slice(0,15)) {
-        const fid = fix.fixture.id;
-        try {
-          const pd = await af(`/fixtures/players?fixture=${fid}&team=${teamId}`);
-          const players = pd.response?.[0]?.players || [];
-          const played = players.find(p=>p.player.id===pid);
-          const isHome = fix.teams.home.id === parseInt(teamId);
-          const goals = isHome?(fix.score.fulltime.home||0):(fix.score.fulltime.away||0);
-          const shots = players.find(p=>p.player.id===pid)?.statistics?.[0]?.shots?.total||0;
-
-          if (played && (played.statistics?.[0]?.games?.minutes||0) >= 45) {
-            withPlayer.push({ goals, shots });
-          } else {
-            withoutPlayer.push({ goals });
-          }
-        } catch(e) {}
-      }
+      const withPlayer = withPlayerMap[pid], withoutPlayer = withoutPlayerMap[pid];
 
       if (withPlayer.length >= 3) {
         const avgWith = withPlayer.reduce((s,m)=>s+m.goals,0)/withPlayer.length;
@@ -1119,7 +1212,6 @@ app.get('/player-impact', async (req, res) => {
       }
     }
 
-    // Verificar si jugador clave está en alineación del próximo partido
     let startingKeyPlayers = [];
     if (fixtureId) {
       try {
@@ -1139,6 +1231,73 @@ app.get('/player-impact', async (req, res) => {
       keyPlayers: Object.values(playerImpact).sort((a,b)=>(b.impact||0)-(a.impact||0)),
       startingKeyPlayers,
       hasKeyPlayersStarting: startingKeyPlayers.length > 0,
+    });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+
+// ── GOLEADORES POR EQUIPO EN EL TORNEO ────────────────────────────────────
+app.get('/players/scorers', async (req, res) => {
+  const { teamId, leagueId } = req.query;
+  if (!teamId) return res.status(400).json({ error: 'Se requiere teamId' });
+  try {
+    const season = await getActiveSeason(teamId);
+
+    // Obtener liga activa si no se especifica
+    // FIX: se agregó &type=League (antes faltaba, causaba que se tomara la
+    // primera competición del array — a veces una copa/torneo secundario —
+    // en vez de la liga doméstica principal, dejando el endpoint sin datos).
+    const lgId = leagueId || await (async () => {
+      try {
+        const r = await af(`/leagues?team=${teamId}&current=true&type=League`);
+        return r.response?.[0]?.league?.id || null;
+      } catch(e) { return null; }
+    })();
+
+    if (!lgId) return res.json({ found: false, players: [] });
+
+    const [scorersR, squadR] = await Promise.all([
+      af(`/players/topscorers?league=${lgId}&season=${season}`),
+      af(`/players/squads?team=${teamId}`),
+    ]);
+
+    const squadIds = new Set(
+      (squadR.response?.[0]?.players || []).map(p => p.id)
+    );
+
+    const scorers = (scorersR.response || [])
+      .filter(entry => squadIds.has(entry.player.id))
+      .slice(0, 8)
+      .map(entry => {
+        const stats = entry.statistics?.[0] || {};
+        return {
+          id: entry.player.id,
+          name: entry.player.name,
+          photo: entry.player.photo,
+          goals: stats.goals?.total || 0,
+          assists: stats.goals?.assists || 0,
+          games: stats.games?.appearences || 0,
+          minutesPerGoal: stats.goals?.total > 0
+            ? Math.round((stats.games?.minutes || 0) / stats.goals.total)
+            : null,
+          goalsPerGame: stats.goals?.total > 0 && stats.games?.appearences > 0
+            ? +(stats.goals.total / stats.games.appearences).toFixed(2)
+            : 0,
+          onTarget: stats.shots?.on || 0,
+          shotsPerGame: stats.games?.appearences > 0
+            ? +((stats.shots?.total || 0) / stats.games.appearences).toFixed(1)
+            : 0,
+        };
+      })
+      .filter(p => p.goals > 0 || p.games >= 2)
+      .sort((a, b) => b.goals - a.goals || b.goalsPerGame - a.goalsPerGame);
+
+    res.json({
+      found: scorers.length > 0,
+      leagueId: lgId,
+      season,
+      teamId: parseInt(teamId),
+      players: scorers,
     });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
