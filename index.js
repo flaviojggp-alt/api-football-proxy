@@ -22,7 +22,7 @@ const ODDS_SPORT_MAP = {
   'soccer_brazil_campeonato': 'soccer_brazil_campeonato',
   'soccer_argentina_primera_division': 'soccer_argentina_primera_division',
   'soccer_mexico_ligamx':     'soccer_mexico_ligamx',
-  'soccer_world_cup':         'soccer_world_cup',
+  'soccer_fifa_world_cup':    'soccer_fifa_world_cup',
   'soccer_copa_america':      'soccer_copa_america',
   // Default fallback
   'default': 'soccer_epl'
@@ -57,6 +57,117 @@ setInterval(() => {
     if (now - entry.ts > AF_CACHE_TTL_MS) _afCache.delete(key);
   }
 }, 5 * 60 * 1000).unref();
+
+// ── ALERTAS PROACTIVAS (Telegram) ───────────────────────────────────────────
+// Watchlist en memoria: partidos que el usuario agrego desde el tool. Cada
+// N minutos revisamos si la cuota consenso se movio significativamente desde
+// la ultima revision, y si es asi mandamos un mensaje a Telegram sin que el
+// usuario tenga que tener el tool abierto.
+// NOTA: watchlist vive en memoria del proceso -> se pierde si Render reinicia
+// el servicio (redeploy, restart por inactividad, etc). Para un tool personal
+// esto es aceptable; si se necesita persistencia real habria que moverlo a
+// una tabla de Supabase.
+const watchlist = new Map(); // fixtureId -> { home, away, sport, lastConsensus, addedAt, commenceTime }
+const WATCHLIST_CHECK_INTERVAL_MS = 10 * 60 * 1000; // 10 min
+const LINE_MOVE_ALERT_THRESHOLD = 0.04; // 4 puntos de probabilidad implicita
+
+async function sendTelegram(message) {
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  const chatId = process.env.TELEGRAM_CHAT_ID;
+  if (!token || !chatId) return { sent: false, reason: 'TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID no configurados' };
+  try {
+    const r = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, text: message, parse_mode: 'HTML' }),
+    });
+    const data = await r.json();
+    return { sent: !!data.ok, data };
+  } catch (e) {
+    return { sent: false, reason: e.message };
+  }
+}
+
+// Promedio de cuotas h2h -> probabilidad implicita del local, sin margen de casa.
+// Version liviana (no historica) para no gastar creditos extra en cada chequeo del cron.
+async function getCurrentConsensusProb(home, away, sport) {
+  const ODDS_KEY = process.env.ODDS_API_KEY;
+  if (!ODDS_KEY) return null;
+  const sportKey = normalizeSport(sport);
+  const r = await fetch(`${ODDS_BASE}/sports/${sportKey}/odds/?apiKey=${ODDS_KEY}&regions=eu&markets=h2h&oddsFormat=decimal`);
+  const games = await r.json();
+  if (!Array.isArray(games)) return null;
+  const hL = home.toLowerCase(), aL = away.toLowerCase();
+  const match = games.find(g => {
+    const ht = g.home_team.toLowerCase(), at = g.away_team.toLowerCase();
+    return (ht.includes(hL) || hL.includes(ht.split(' ')[0])) && (at.includes(aL) || aL.includes(at.split(' ')[0]));
+  });
+  if (!match) return null;
+  const rows = [];
+  match.bookmakers.forEach(bm => {
+    const h2h = bm.markets.find(m => m.key === 'h2h');
+    if (!h2h) return;
+    const ho = h2h.outcomes.find(o => o.name === match.home_team)?.price;
+    const ao = h2h.outcomes.find(o => o.name === match.away_team)?.price;
+    if (ho && ao) rows.push({ home: ho, away: ao });
+  });
+  if (!rows.length) return null;
+  const avgHome = rows.reduce((s, r) => s + r.home, 0) / rows.length;
+  const avgAway = rows.reduce((s, r) => s + r.away, 0) / rows.length;
+  const invH = 1 / avgHome, invA = 1 / avgAway;
+  return { homeProb: invH / (invH + invA), commenceTime: match.commence_time };
+}
+
+async function checkWatchlist() {
+  if (!process.env.TELEGRAM_BOT_TOKEN || !watchlist.size) return;
+  for (const [fixtureId, entry] of watchlist) {
+    // Quitar partidos que ya empezaron/pasaron
+    if (entry.commenceTime && new Date(entry.commenceTime) < new Date()) {
+      watchlist.delete(fixtureId);
+      continue;
+    }
+    try {
+      const result = await getCurrentConsensusProb(entry.home, entry.away, entry.sport);
+      if (!result) continue;
+      entry.commenceTime = entry.commenceTime || result.commenceTime;
+      if (entry.lastConsensus != null) {
+        const shift = result.homeProb - entry.lastConsensus;
+        if (Math.abs(shift) >= LINE_MOVE_ALERT_THRESHOLD) {
+          const direction = shift > 0 ? entry.home : entry.away;
+          await sendTelegram(
+            `⚠️ <b>Movimiento de linea</b>\n${entry.home} vs ${entry.away}\n` +
+            `El mercado se movio ${(Math.abs(shift) * 100).toFixed(1)} pts hacia ${direction}.`
+          );
+        }
+      }
+      entry.lastConsensus = result.homeProb;
+    } catch (e) { /* silencioso: un fallo puntual no debe tumbar el cron */ }
+  }
+}
+setInterval(checkWatchlist, WATCHLIST_CHECK_INTERVAL_MS).unref();
+
+app.post('/watchlist/add', (req, res) => {
+  const { fixtureId, home, away, sport } = req.body || {};
+  if (!fixtureId || !home || !away) return res.status(400).json({ error: 'Se requieren fixtureId, home y away' });
+  watchlist.set(String(fixtureId), { home, away, sport: sport || 'default', lastConsensus: null, addedAt: Date.now(), commenceTime: null });
+  res.json({ ok: true, watchlistSize: watchlist.size });
+});
+
+app.post('/watchlist/remove', (req, res) => {
+  const { fixtureId } = req.body || {};
+  watchlist.delete(String(fixtureId));
+  res.json({ ok: true, watchlistSize: watchlist.size });
+});
+
+app.get('/watchlist', (req, res) => {
+  res.json({ entries: Array.from(watchlist.entries()).map(([id, e]) => ({ fixtureId: id, ...e })) });
+});
+
+// Endpoint de prueba manual para confirmar que TELEGRAM_BOT_TOKEN/CHAT_ID funcionan
+app.get('/alerts/test', async (req, res) => {
+  const result = await sendTelegram('✅ Prueba de conexion del betting-tool. Si ves esto, las alertas estan configuradas correctamente.');
+  res.json(result);
+});
 
 // ── MONITOREO DE RATE LIMIT ─────────────────────────────────────────────────
 // API-Football devuelve estos headers en cada respuesta. Los guardamos para
@@ -113,6 +224,8 @@ app.get('/', (req, res) => res.json({
   status:'ok',
   football_key:!!process.env.API_FOOTBALL_KEY,
   odds_key:!!process.env.ODDS_API_KEY,
+  telegram_configured:!!(process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_CHAT_ID),
+  watchlistSize: watchlist.size,
   rateLimit: rateLimitStatus,
   cacheSize: _afCache.size,
 }));
@@ -570,11 +683,29 @@ app.get('/match-importance', async (req, res) => {
     const isLateStage = roundNum && roundNum >= (totalTeams - 2) * 2 - 6;
     const isDerby = false;
 
+    // Deteccion de fase eliminatoria en copas/torneos internacionales (Mundial,
+    // Champions, Copa America, etc.) via el string de ronda. No depende de tabla
+    // de liga -- selecciones nacionales y equipos en fase de grupos/eliminatoria
+    // no tienen "posicion en tabla domestica", asi que sin esto el endpoint
+    // devolvia siempre 'normal' para este tipo de partidos.
+    const roundLower = (round || '').toLowerCase();
+    const cupStageWeight = roundLower.includes('final') && !roundLower.includes('semi') && !roundLower.includes('quarter') ? 1.0
+      : roundLower.includes('semi') ? 0.85
+      : roundLower.includes('quarter') || roundLower.includes('cuartos') ? 0.65
+      : (roundLower.includes('round of 16') || roundLower.includes('octavos')) ? 0.5
+      : 0;
+
     let importance = 'normal';
     let intensityBoost = 0;
     let goalsBoost = 0;
     let notes = [];
 
+    if (cupStageWeight > 0) {
+      importance = cupStageWeight >= 0.85 ? 'muy alta' : cupStageWeight >= 0.5 ? 'alta' : 'media-alta';
+      intensityBoost = cupStageWeight;
+      goalsBoost = cupStageWeight * 0.35;
+      notes.push(`Fase eliminatoria de torneo (${round})`);
+    }
     if (homeRelegation || awayRelegation) {
       importance = 'alta';
       intensityBoost = 0.8;
@@ -893,7 +1024,17 @@ app.get('/odds/compare', async (req, res) => {
       });
     });
 
-    res.json({ found:true, home_team:match.home_team, away_team:match.away_team, comparison, bestOdds:Object.values(bestOdds) });
+    // Linea de Pinnacle -- si esta disponible (requiere tier Business de The
+    // Odds API), es la referencia mas confiable de "linea eficiente" del
+    // mercado, mejor que el consenso promedio de casas retail.
+    const pinnacleH2H = comparison['h2h']?.bookmakers.find(bm => /pinnacle/i.test(bm.name));
+    const pinnacleLine = pinnacleH2H ? {
+      home: pinnacleH2H.outcomes[match.home_team] || null,
+      away: pinnacleH2H.outcomes[match.away_team] || null,
+      draw: pinnacleH2H.outcomes['Draw'] || null,
+    } : null;
+
+    res.json({ found:true, home_team:match.home_team, away_team:match.away_team, comparison, bestOdds:Object.values(bestOdds), pinnacleLine });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
