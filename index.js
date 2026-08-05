@@ -584,6 +584,7 @@ app.get('/stats/advanced', async (req, res) => {
         global:{goals:1.2,corners:5.0,cards:2.0,shots:10.0,saves:3.0},
         contextual:{goals:1.2,corners:5.0,cards:2.0,shots:10.0,saves:3.0},
         topForwards:[],
+        recentMatches:[],
       });
     }
     const totalWeight = allStats.reduce((s,m)=>s+m.recencyWeight,0)||1;
@@ -631,6 +632,11 @@ app.get('/stats/advanced', async (req, res) => {
       global:{goals:+wavg('goals').toFixed(2),corners:+wavg('corners').toFixed(2),cards:+wavg('cards').toFixed(2),shots:+wavg('shots').toFixed(2),saves:+wavg('saves').toFixed(2)},
       contextual:{goals:+ctx('goals').toFixed(2),corners:+ctx('corners').toFixed(2),cards:+ctx('cards').toFixed(2),shots:+ctx('shots').toFixed(2),saves:+ctx('saves').toFixed(2)},
       topForwards,
+      // BUGFIX: el frontend (calcStreak) esperaba este campo para detectar
+      // rachas goleadoras, pero nunca se devolvia -- la deteccion de racha
+      // siempre caia en 'neutral' sin datos reales, aunque allStats ya
+      // tenia todo lo necesario calculado desde antes.
+      recentMatches: allStats.map(m => ({ goals: m.goals, corners: m.corners, cards: m.cards })),
     });
   } catch(e) { res.status(500).json({error:e.message}); }
 });
