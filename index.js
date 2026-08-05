@@ -609,6 +609,56 @@ app.get('/predictions', async (req, res) => {
   } catch(e) { res.status(500).json({error:e.message}); }
 });
 
+// Resultado final de un partido especifico -- usado por la herramienta para
+// sugerir si una apuesta gano o perdio, comparando el mercado contra el
+// resultado real (goles, corners, tarjetas, ambos marcan).
+app.get('/fixtures/result', async (req, res) => {
+  const { fixtureId } = req.query;
+  if (!fixtureId) return res.status(400).json({ error: 'Se requiere fixtureId' });
+  try {
+    const d = await af(`/fixtures?id=${fixtureId}`);
+    const fx = d?.response?.[0];
+    if (!fx) return res.json({ found: false });
+    const status = fx.fixture?.status?.short;
+    const finished = status === 'FT' || status === 'AET' || status === 'PEN';
+    const homeTeam = fx.teams?.home?.name;
+    const awayTeam = fx.teams?.away?.name;
+    const homeGoals = fx.goals?.home ?? 0;
+    const awayGoals = fx.goals?.away ?? 0;
+
+    let homeCorners = null, awayCorners = null, homeCards = null, awayCards = null;
+    if (finished) {
+      try {
+        const statsD = await af(`/fixtures/statistics?fixture=${fixtureId}`);
+        const stats = statsD?.response || [];
+        const getStat = (teamId, type) => {
+          const teamStats = stats.find(s => s.team?.id === teamId)?.statistics || [];
+          return parseFloat(teamStats.find(s => s.type === type)?.value) || 0;
+        };
+        homeCorners = getStat(fx.teams.home.id, 'Corner Kicks');
+        awayCorners = getStat(fx.teams.away.id, 'Corner Kicks');
+        homeCards = getStat(fx.teams.home.id, 'Yellow Cards') + getStat(fx.teams.home.id, 'Red Cards');
+        awayCards = getStat(fx.teams.away.id, 'Yellow Cards') + getStat(fx.teams.away.id, 'Red Cards');
+      } catch(e) { /* stats pueden no estar disponibles para todas las ligas -- seguir sin ellas */ }
+    }
+
+    res.json({
+      found: true,
+      finished,
+      status,
+      homeTeam, awayTeam,
+      homeGoals, awayGoals,
+      totalGoals: homeGoals + awayGoals,
+      btts: homeGoals > 0 && awayGoals > 0,
+      winner: homeGoals > awayGoals ? homeTeam : awayGoals > homeGoals ? awayTeam : 'draw',
+      homeCorners, awayCorners,
+      totalCorners: (homeCorners !== null && awayCorners !== null) ? homeCorners + awayCorners : null,
+      homeCards, awayCards,
+      totalCards: (homeCards !== null && awayCards !== null) ? homeCards + awayCards : null,
+    });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 // H2H
 app.get('/h2h', async (req, res) => {
   const { home, away, last } = req.query;
