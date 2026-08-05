@@ -67,9 +67,10 @@ setInterval(() => {
 // el servicio (redeploy, restart por inactividad, etc). Para un tool personal
 // esto es aceptable; si se necesita persistencia real habria que moverlo a
 // una tabla de Supabase.
-const watchlist = new Map(); // fixtureId -> { home, away, sport, lastConsensus, addedAt, commenceTime }
+const watchlist = new Map(); // fixtureId -> { home, away, sport, lastConsensus, addedAt, commenceTime, closingLines, closingCapturedAt }
 const WATCHLIST_CHECK_INTERVAL_MS = 10 * 60 * 1000; // 10 min
 const LINE_MOVE_ALERT_THRESHOLD = 0.04; // 4 puntos de probabilidad implicita
+const WATCHLIST_CLEANUP_AFTER_MS = 48 * 60 * 60 * 1000; // limpiar 48h despues del kickoff
 
 async function sendTelegram(message) {
   const token = process.env.TELEGRAM_BOT_TOKEN;
@@ -88,13 +89,16 @@ async function sendTelegram(message) {
   }
 }
 
-// Promedio de cuotas h2h -> probabilidad implicita del local, sin margen de casa.
-// Version liviana (no historica) para no gastar creditos extra en cada chequeo del cron.
-async function getCurrentConsensusProb(home, away, sport) {
+// Snapshot de cuotas h2h + totales de goles (ambos son mercados estandar de
+// The Odds API en cualquier plan). NO se intentan mercados de corners/tarjetas
+// aqui porque generalmente requieren un market key especial (ej. mercados
+// "alternativos") que puede no existir en el plan del usuario, y mezclarlo con
+// una consulta que si funciona arriesgaria romper la consulta completa.
+async function getOddsSnapshot(home, away, sport) {
   const ODDS_KEY = process.env.ODDS_API_KEY;
   if (!ODDS_KEY) return null;
   const sportKey = normalizeSport(sport);
-  const r = await fetch(`${ODDS_BASE}/sports/${sportKey}/odds/?apiKey=${ODDS_KEY}&regions=eu&markets=h2h&oddsFormat=decimal`);
+  const r = await fetch(`${ODDS_BASE}/sports/${sportKey}/odds/?apiKey=${ODDS_KEY}&regions=eu&markets=h2h,totals&oddsFormat=decimal`);
   const games = await r.json();
   if (!Array.isArray(games)) return null;
   const hL = home.toLowerCase(), aL = away.toLowerCase();
@@ -103,34 +107,82 @@ async function getCurrentConsensusProb(home, away, sport) {
     return (ht.includes(hL) || hL.includes(ht.split(' ')[0])) && (at.includes(aL) || aL.includes(at.split(' ')[0]));
   });
   if (!match) return null;
-  const rows = [];
+
+  const h2hRows = [];
+  const totalsByPoint = {}; // point -> { over: [], under: [] }
   match.bookmakers.forEach(bm => {
     const h2h = bm.markets.find(m => m.key === 'h2h');
-    if (!h2h) return;
-    const ho = h2h.outcomes.find(o => o.name === match.home_team)?.price;
-    const ao = h2h.outcomes.find(o => o.name === match.away_team)?.price;
-    if (ho && ao) rows.push({ home: ho, away: ao });
+    if (h2h) {
+      const ho = h2h.outcomes.find(o => o.name === match.home_team)?.price;
+      const ao = h2h.outcomes.find(o => o.name === match.away_team)?.price;
+      const draw = h2h.outcomes.find(o => o.name === 'Draw')?.price;
+      if (ho && ao) h2hRows.push({ home: ho, away: ao, draw: draw || null });
+    }
+    const totals = bm.markets.find(m => m.key === 'totals');
+    if (totals) {
+      totals.outcomes.forEach(o => {
+        const point = o.point;
+        if (point == null) return;
+        totalsByPoint[point] = totalsByPoint[point] || { over: [], under: [] };
+        if (o.name === 'Over') totalsByPoint[point].over.push(o.price);
+        if (o.name === 'Under') totalsByPoint[point].under.push(o.price);
+      });
+    }
   });
-  if (!rows.length) return null;
-  const avgHome = rows.reduce((s, r) => s + r.home, 0) / rows.length;
-  const avgAway = rows.reduce((s, r) => s + r.away, 0) / rows.length;
-  const invH = 1 / avgHome, invA = 1 / avgAway;
-  return { homeProb: invH / (invH + invA), commenceTime: match.commence_time };
+
+  const avg = (arr) => arr.length ? arr.reduce((s,v)=>s+v,0)/arr.length : null;
+  const totalsList = Object.keys(totalsByPoint).map(point => ({
+    point: parseFloat(point),
+    over: avg(totalsByPoint[point].over),
+    under: avg(totalsByPoint[point].under),
+  }));
+
+  let homeProb = null;
+  if (h2hRows.length) {
+    const avgHome = avg(h2hRows.map(r=>r.home));
+    const avgAway = avg(h2hRows.map(r=>r.away));
+    const invH = 1/avgHome, invA = 1/avgAway;
+    homeProb = invH / (invH + invA);
+  }
+
+  return {
+    homeProb,
+    commenceTime: match.commence_time,
+    h2h: h2hRows.length ? { home: avg(h2hRows.map(r=>r.home)), away: avg(h2hRows.map(r=>r.away)), draw: avg(h2hRows.map(r=>r.draw).filter(v=>v)) } : null,
+    totals: totalsList,
+  };
 }
 
 async function checkWatchlist() {
-  if (!process.env.TELEGRAM_BOT_TOKEN || !watchlist.size) return;
+  if (!watchlist.size) return;
   for (const [fixtureId, entry] of watchlist) {
-    // Quitar partidos que ya empezaron/pasaron
-    if (entry.commenceTime && new Date(entry.commenceTime) < new Date()) {
+    const now = new Date();
+    const commenced = entry.commenceTime && new Date(entry.commenceTime) < now;
+
+    // Limpieza: ya se capturo la linea de cierre (o nunca se pudo) y paso
+    // suficiente tiempo desde el kickoff -- ya no hace falta mantenerlo en memoria.
+    if (commenced && (now - new Date(entry.commenceTime)) > WATCHLIST_CLEANUP_AFTER_MS) {
       watchlist.delete(fixtureId);
       continue;
     }
+
+    // El partido ya empezo: intentar UNA captura final de la linea de cierre
+    // si todavia no se hizo, y no seguir con la logica de alertas.
+    if (commenced) {
+      if (!entry.closingLines) {
+        try {
+          const snap = await getOddsSnapshot(entry.home, entry.away, entry.sport);
+          if (snap) { entry.closingLines = snap; entry.closingCapturedAt = now.toISOString(); }
+        } catch(e) { /* el partido puede haber desaparecido del feed de cuotas -- seguir sin cerrar */ }
+      }
+      continue;
+    }
+
     try {
-      const result = await getCurrentConsensusProb(entry.home, entry.away, entry.sport);
+      const result = await getOddsSnapshot(entry.home, entry.away, entry.sport);
       if (!result) continue;
       entry.commenceTime = entry.commenceTime || result.commenceTime;
-      if (entry.lastConsensus != null) {
+      if (result.homeProb != null && entry.lastConsensus != null) {
         const shift = result.homeProb - entry.lastConsensus;
         if (Math.abs(shift) >= LINE_MOVE_ALERT_THRESHOLD) {
           const direction = shift > 0 ? entry.home : entry.away;
@@ -140,7 +192,7 @@ async function checkWatchlist() {
           );
         }
       }
-      entry.lastConsensus = result.homeProb;
+      if (result.homeProb != null) entry.lastConsensus = result.homeProb;
     } catch (e) { /* silencioso: un fallo puntual no debe tumbar el cron */ }
   }
 }
@@ -149,7 +201,7 @@ setInterval(checkWatchlist, WATCHLIST_CHECK_INTERVAL_MS).unref();
 app.post('/watchlist/add', (req, res) => {
   const { fixtureId, home, away, sport } = req.body || {};
   if (!fixtureId || !home || !away) return res.status(400).json({ error: 'Se requieren fixtureId, home y away' });
-  watchlist.set(String(fixtureId), { home, away, sport: sport || 'default', lastConsensus: null, addedAt: Date.now(), commenceTime: null });
+  watchlist.set(String(fixtureId), { home, away, sport: sport || 'default', lastConsensus: null, addedAt: Date.now(), commenceTime: null, closingLines: null, closingCapturedAt: null });
   res.json({ ok: true, watchlistSize: watchlist.size });
 });
 
@@ -161,6 +213,15 @@ app.post('/watchlist/remove', (req, res) => {
 
 app.get('/watchlist', (req, res) => {
   res.json({ entries: Array.from(watchlist.entries()).map(([id, e]) => ({ fixtureId: id, ...e })) });
+});
+
+// Linea de cierre capturada automaticamente para un fixture especifico --
+// usada por la herramienta para autocompletar el CLV al liquidar una apuesta.
+app.get('/watchlist/closing', (req, res) => {
+  const { fixtureId } = req.query;
+  const entry = watchlist.get(String(fixtureId));
+  if (!entry || !entry.closingLines) return res.json({ found: false });
+  res.json({ found: true, closingLines: entry.closingLines, capturedAt: entry.closingCapturedAt });
 });
 
 // Endpoint de prueba manual para confirmar que TELEGRAM_BOT_TOKEN/CHAT_ID funcionan
