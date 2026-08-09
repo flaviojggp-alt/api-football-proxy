@@ -159,29 +159,30 @@ async function checkWatchlist() {
     const now = new Date();
     const commenced = entry.commenceTime && new Date(entry.commenceTime) < now;
 
-    // Limpieza: ya se capturo la linea de cierre (o nunca se pudo) y paso
-    // suficiente tiempo desde el kickoff -- ya no hace falta mantenerlo en memoria.
+    // Limpieza: ya paso suficiente tiempo desde el kickoff -- ya no hace
+    // falta mantenerlo en memoria.
     if (commenced && (now - new Date(entry.commenceTime)) > WATCHLIST_CLEANUP_AFTER_MS) {
       watchlist.delete(fixtureId);
       continue;
     }
 
-    // El partido ya empezo: intentar UNA captura final de la linea de cierre
-    // si todavia no se hizo, y no seguir con la logica de alertas.
-    if (commenced) {
-      if (!entry.closingLines) {
-        try {
-          const snap = await getOddsSnapshot(entry.home, entry.away, entry.sport);
-          if (snap) { entry.closingLines = snap; entry.closingCapturedAt = now.toISOString(); }
-        } catch(e) { /* el partido puede haber desaparecido del feed de cuotas -- seguir sin cerrar */ }
-      }
-      continue;
-    }
+    // BUGFIX: antes se intentaba capturar la linea de cierre DESPUES de que
+    // el partido arrancaba -- pero las casas de apuestas suelen quitar las
+    // cuotas pre-partido del feed apenas empieza el juego (pasa a "live"),
+    // asi que casi siempre llegaba tarde y no encontraba nada, sin importar
+    // el mercado. Ahora ya no se intenta un fetch nuevo despues del kickoff.
+    if (commenced) continue;
 
+    // Aun no comienza: actualizar el snapshot en cada chequeo (cada ~10 min).
+    // closingLines se sobreescribe cada vez -- el ULTIMO snapshot capturado
+    // antes de que el partido arranque queda guardado como "linea de cierre",
+    // que es la mejor aproximacion posible con un cron de intervalo fijo.
     try {
       const result = await getOddsSnapshot(entry.home, entry.away, entry.sport);
       if (!result) continue;
       entry.commenceTime = entry.commenceTime || result.commenceTime;
+      entry.closingLines = result;
+      entry.closingCapturedAt = now.toISOString();
       if (result.homeProb != null && entry.lastConsensus != null) {
         const shift = result.homeProb - entry.lastConsensus;
         if (Math.abs(shift) >= LINE_MOVE_ALERT_THRESHOLD) {
