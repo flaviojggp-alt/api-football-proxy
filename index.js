@@ -1125,7 +1125,13 @@ app.get('/odds/compare', async (req, res) => {
       bm.markets.forEach(mkt => {
         if (!comparison[mkt.key]) comparison[mkt.key] = { market: mkt.key, bookmakers: [] };
         const outcomes = {};
-        mkt.outcomes.forEach(o => { outcomes[o.name] = o.price; });
+        mkt.outcomes.forEach(o => {
+          // BUGFIX: antes se guardaba outcomes[o.name] sin el "point" (linea),
+          // asi que "Over" a 2.5 y "Over" a 3.5 se pisaban entre si -- solo
+          // sobrevivia el de mayor precio, sin importar la linea real.
+          const outcomeKey = o.point != null ? `${o.name} ${o.point}` : o.name;
+          outcomes[outcomeKey] = o.price;
+        });
         comparison[mkt.key].bookmakers.push({ name: bm.title, outcomes });
       });
     });
