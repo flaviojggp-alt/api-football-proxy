@@ -98,7 +98,11 @@ async function getOddsSnapshot(home, away, sport) {
   const ODDS_KEY = process.env.ODDS_API_KEY;
   if (!ODDS_KEY) return null;
   const sportKey = normalizeSport(sport);
-  const r = await fetch(`${ODDS_BASE}/sports/${sportKey}/odds/?apiKey=${ODDS_KEY}&regions=eu&markets=h2h,totals&oddsFormat=decimal`);
+  // MEJORA: se agrega 'btts' a los mercados solicitados -- antes solo se
+  // pedian h2h y totals, asi que "Ambos equipos marcan" nunca podia
+  // autocompletar su cuota de cierre, sin importar que tan bien cubierto
+  // estuviera el partido por las casas de apuestas.
+  const r = await fetch(`${ODDS_BASE}/sports/${sportKey}/odds/?apiKey=${ODDS_KEY}&regions=eu&markets=h2h,totals,btts&oddsFormat=decimal`);
   const games = await r.json();
   if (!Array.isArray(games)) return null;
   const hL = home.toLowerCase(), aL = away.toLowerCase();
@@ -110,6 +114,7 @@ async function getOddsSnapshot(home, away, sport) {
 
   const h2hRows = [];
   const totalsByPoint = {}; // point -> { over: [], under: [] }
+  const bttsRows = { yes: [], no: [] };
   match.bookmakers.forEach(bm => {
     const h2h = bm.markets.find(m => m.key === 'h2h');
     if (h2h) {
@@ -127,6 +132,13 @@ async function getOddsSnapshot(home, away, sport) {
         if (o.name === 'Over') totalsByPoint[point].over.push(o.price);
         if (o.name === 'Under') totalsByPoint[point].under.push(o.price);
       });
+    }
+    const btts = bm.markets.find(m => m.key === 'btts');
+    if (btts) {
+      const yes = btts.outcomes.find(o => o.name === 'Yes')?.price;
+      const no = btts.outcomes.find(o => o.name === 'No')?.price;
+      if (yes) bttsRows.yes.push(yes);
+      if (no) bttsRows.no.push(no);
     }
   });
 
@@ -150,6 +162,7 @@ async function getOddsSnapshot(home, away, sport) {
     commenceTime: match.commence_time,
     h2h: h2hRows.length ? { home: avg(h2hRows.map(r=>r.home)), away: avg(h2hRows.map(r=>r.away)), draw: avg(h2hRows.map(r=>r.draw).filter(v=>v)) } : null,
     totals: totalsList,
+    btts: (bttsRows.yes.length || bttsRows.no.length) ? { yes: avg(bttsRows.yes), no: avg(bttsRows.no) } : null,
   };
 }
 
